@@ -178,3 +178,5 @@ wait
 2. Лав Р. Ядро Linux: описание процесса разработки / Р. Лав. — 3-е изд. — Москва : Вильямс, 2014. — 496 с.
 3. sched(7) — Linux manual page // man7.org : [сайт]. — URL: https://man7.org/linux/man-pages/man7/sched.7.html (дата обращения: 20.07.2026).
 4. EEVDF Scheduler // The Linux Kernel documentation : [сайт]. — URL: https://docs.kernel.org/scheduler/sched-eevdf.html (дата обращения: 20.07.2026).
+5. Гуляков А.Д. Положение о курсовом проектировании обучающихся (164337 v1) — Пенза : 2016. — 13 c. 
+6. Распоряжение по требованиям к оформлению КП и ТЗ на кафедре ИБСТ_2018_02 — Пенза : 2018. — 18 c.
