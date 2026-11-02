@@ -18,12 +18,15 @@ specific GOST style ids that build.py transplants from reference.docx, so
 title styles never enter any check.
 """
 
+import os
 import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+R_ID = "{%s}id" % R_NS
 
 
 def w(tag: str) -> str:
@@ -95,6 +98,88 @@ REQUIRED_STYLE_IDS = [
     "TableCaption1",
     "UnnumberedHeading1NoTOC1",  # СОДЕРЖАНИЕ heading used by add_toc
 ]
+
+# ---------------------------------------------------------------------------
+# Profile-aware expectations
+#
+# Values below are fallbacks. When the skill's profile package is reachable
+# (templates/<profile>/reference.docx), the expected geometry and body
+# typography are read FROM that file — the reference document is the single
+# source of truth (ПГУ ИБСТ: right margin 10 mm, not 15).
+# ---------------------------------------------------------------------------
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEMPLATES_DIR = os.path.join(SKILL_DIR, "templates")
+DEFAULT_PROFILE = "my"
+LEGACY_PROFILE = "from_the_repository"
+
+
+class Expect:
+    """Expected values, profiled by the reference.docx of the university."""
+
+    def __init__(self):
+        self.font = NORMAL_FONT
+        self.sz = NORMAL_SZ
+        self.line = LINE_ONE_AND_HALF
+        self.line_rule = LINE_RULE
+        self.jc = NORMAL_JC
+        self.first_line = FIRST_LINE_TWIPS
+        self.first_line_tol = FIRST_LINE_TOL
+        self.margins = {
+            "left": MARGIN_LEFT, "right": MARGIN_RIGHT,
+            "top": MARGIN_TOP, "bottom": MARGIN_BOTTOM,
+        }
+        self.margin_tol = MARGIN_TOL
+        self.page_w = PAGE_W
+        self.page_h = PAGE_H
+        self.page_tol = PAGE_TOL
+        self.source = "built-in fallback"
+
+    def load(self, profile: str) -> "Expect":
+        path = os.path.join(TEMPLATES_DIR, profile, "reference.docx")
+        if not os.path.exists(path):
+            path = os.path.join(TEMPLATES_DIR, LEGACY_PROFILE, "reference.docx")
+        if not os.path.exists(path):
+            return self
+        try:
+            zf = zipfile.ZipFile(path)
+            styles_root = ET.fromstring(zf.read("word/styles.xml"))
+            doc_root = ET.fromstring(zf.read("word/document.xml"))
+        except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+            print(f"Note: cannot read {path} ({exc}); using fallback expectations")
+            return self
+
+        styles = Styles(styles_root)
+        self.font = styles.resolve("Normal", pick_rpr_font) or self.font
+        self.sz = _int(styles.resolve("Normal", pick_rpr_sz)) or self.sz
+        sp = styles.resolve("Normal", pick_ppr_spacing)
+        if sp and _int(sp[0]):
+            self.line = _int(sp[0])
+            self.line_rule = sp[1] or self.line_rule
+        self.jc = styles.resolve("Normal", pick_ppr_jc) or self.jc
+        for sid in ("BodyText", "FirstParagraph1"):
+            fl = _int(styles.resolve(sid, pick_ppr_first_line))
+            if fl is not None:
+                self.first_line = fl
+                break
+
+        sect = None
+        for sect in doc_root.iter(w("sectPr")):
+            pass
+        if sect is not None:
+            mar = sect.find(w("pgMar"))
+            if mar is not None:
+                for side in self.margins:
+                    val = _int(mar.get(w(side)))
+                    if val is not None:
+                        self.margins[side] = val
+            pgsz = sect.find(w("pgSz"))
+            if pgsz is not None:
+                self.page_w = _int(pgsz.get(w("w"))) or self.page_w
+                self.page_h = _int(pgsz.get(w("h"))) or self.page_h
+        self.source = path
+        return self
+
 
 # Known artifact of the LibreOffice-authored templates: style ids "-1"/"-2"
 # exist both as character/paragraph AND table styles. Word resolves them by
@@ -239,10 +324,18 @@ def _int(val):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python verify.py <report.docx>")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    profile = DEFAULT_PROFILE
+    for arg in sys.argv[1:]:
+        if arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1].strip() or DEFAULT_PROFILE
+    if len(args) != 1:
+        print("Usage: python verify.py <report.docx> [--profile=my|from_the_repository]")
         sys.exit(2)
-    path = sys.argv[1]
+    path = args[0]
+
+    exp = Expect().load(profile)
+    print(f"Profile: {profile} (expectations from {exp.source})")
 
     try:
         zf = zipfile.ZipFile(path)
@@ -278,33 +371,36 @@ def main():
 
     # -- 2. Normal: font / size / line spacing / justification -------------
     font = styles.resolve("Normal", pick_rpr_font)
-    r.check("normal-font", font == NORMAL_FONT, font, NORMAL_FONT)
+    r.check("normal-font", font == exp.font, font, exp.font)
 
     sz = _int(styles.resolve("Normal", pick_rpr_sz))
-    r.check("normal-size", sz == NORMAL_SZ,
-            f"{sz} half-points" if sz else sz, f"{NORMAL_SZ} half-points (14 pt)")
+    r.check("normal-size", sz == exp.sz,
+            f"{sz} half-points" if sz else sz, f"{exp.sz} half-points (14 pt)")
 
     spacing = styles.resolve("Normal", pick_ppr_spacing)
     ok = (
         spacing is not None
-        and _int(spacing[0]) == LINE_ONE_AND_HALF
-        and (spacing[1] or "auto") == LINE_RULE
+        and _int(spacing[0]) == exp.line
+        and (spacing[1] or "auto") == exp.line_rule
     )
     r.check("normal-line-spacing", ok,
             f"line={spacing[0]} rule={spacing[1]}" if spacing else None,
-            f"line={LINE_ONE_AND_HALF} rule={LINE_RULE} (1.5 spacing)")
+            f"line={exp.line} rule={exp.line_rule} (1.5 spacing)")
 
     jc = styles.resolve("Normal", pick_ppr_jc)
-    r.check("normal-justified", jc == NORMAL_JC, jc, NORMAL_JC)
+    r.check("normal-justified", jc == exp.jc, jc, exp.jc)
 
     # -- 3. Red line: first-line indent 1.25 cm on body styles -------------
     for sid in ("BodyText", "FirstParagraph1"):
         fl = styles.resolve(sid, pick_ppr_first_line)
         fl_int = _int(fl)
-        ok = fl_int is not None and abs(fl_int - FIRST_LINE_TWIPS) <= FIRST_LINE_TOL
+        ok = (
+            fl_int is not None
+            and abs(fl_int - exp.first_line) <= exp.first_line_tol
+        )
         r.check(f"first-line-indent[{sid}]", ok,
                 f"{fl} twips" if fl is not None else "none",
-                f"{FIRST_LINE_TWIPS} twips (1.25 cm)")
+                f"{exp.first_line} twips (1.25 cm)")
 
     # -- 4. Headings resolve to bold ----------------------------------------
     for sid in ("Heading1", "Heading2", "Heading3"):
@@ -324,33 +420,109 @@ def main():
         pass  # keep last
     if sect is None:
         r.check("page-margins", False, "no sectPr found",
-                "left/right/top/bottom = 1701/851/1134/1134 twips")
-        r.check("page-size-a4", False, "no sectPr found", "11906x16838 twips")
+                "left/right/top/bottom = {}/{}... twips".format(
+                    exp.margins["left"], exp.margins["right"]))
+        r.check("page-size-a4", False, "no sectPr found",
+                f"{exp.page_w}x{exp.page_h} twips")
     else:
         mar = sect.find(w("pgMar"))
         vals = {
             side: _int(mar.get(w(side))) if mar is not None else None
             for side in ("left", "right", "top", "bottom")
         }
-        exp = {"left": MARGIN_LEFT, "right": MARGIN_RIGHT,
-               "top": MARGIN_TOP, "bottom": MARGIN_BOTTOM}
+        want = exp.margins
         ok = all(
-            vals[s] is not None and abs(vals[s] - exp[s]) <= MARGIN_TOL
-            for s in exp
+            vals[s] is not None and abs(vals[s] - want[s]) <= exp.margin_tol
+            for s in want
         )
         r.check(
             "page-margins", ok,
             "/".join(str(vals[s]) for s in ("left", "right", "top", "bottom")),
-            "1701/851/1134/1134 twips +-20 (30/15/20/20 mm)",
+            "/".join(str(want[s]) for s in ("left", "right", "top", "bottom"))
+            + " twips +-20",
         )
         pgsz = sect.find(w("pgSz"))
         pw = _int(pgsz.get(w("w"))) if pgsz is not None else None
         ph = _int(pgsz.get(w("h"))) if pgsz is not None else None
         ok = (
             pw is not None and ph is not None
-            and abs(pw - PAGE_W) <= PAGE_TOL and abs(ph - PAGE_H) <= PAGE_TOL
+            and abs(pw - exp.page_w) <= exp.page_tol
+            and abs(ph - exp.page_h) <= exp.page_tol
         )
-        r.check("page-size-a4", ok, f"{pw}x{ph}", f"{PAGE_W}x{PAGE_H} twips (A4 portrait)")
+        r.check("page-size-a4", ok, f"{pw}x{ph}",
+                f"{exp.page_w}x{exp.page_h} twips (A4 portrait)")
+
+    # -- 6b. Page numbers: bottom-centre, no number on the title page -------
+    # Title template supplies the title section (with its own titlePg), the
+    # body section carries the PAGEFAULT footer copied by pandoc from
+    # reference.docx: centered PAGE field + <w:titlePg/>.
+    footer_parts = [n for n in zf.namelist()
+                    if re.match(r"word/footer\d*\.xml$", n)]
+    page_field = False
+    centered = False
+    for name in footer_parts:
+        try:
+            froot = ET.fromstring(zf.read(name))
+        except ET.ParseError:
+            continue
+        has_page = any(
+            "PAGE" in (el.text or "") for el in froot.iter(w("instrText"))
+        )
+        if not has_page:
+            continue
+        page_field = True
+        for para in froot.iter(w("p")):
+            jc_el = para.find(w("pPr") + "/" + w("jc"))
+            jc_val = jc_el.get(w("val")) if jc_el is not None else None
+            if jc_val is None:
+                style_el = para.find(w("pPr") + "/" + w("pStyle"))
+                if style_el is not None:
+                    jc_val = styles.resolve(style_el.get(w("val")), pick_ppr_jc)
+            if jc_val == "center":
+                centered = True
+    r.check("page-number-field", page_field,
+            f"{len(footer_parts)} footer part(s)" if footer_parts else "no footers",
+            "a footer with a PAGE field")
+    r.check("page-number-centered", centered, centered, "PAGE field centered")
+
+    # Первая страница (титул) должна быть без номера: либо единственная секция
+    # с titlePg и пустым «first»-колонтитулом, либо отдельная первая секция с
+    # пустыми колонтитулами.
+    def footer_has_page(target: str) -> bool:
+        try:
+            froot = ET.fromstring(zf.read("word/" + target))
+        except (KeyError, ET.ParseError):
+            return False
+        return any("PAGE" in (el.text or "") for el in froot.iter(w("instrText")))
+
+    rel_map = {}
+    try:
+        rel_root = ET.fromstring(zf.read("word/_rels/document.xml.rels"))
+        for rel in rel_root:
+            rel_map[rel.get("Id")] = rel.get("Target")
+    except (KeyError, ET.ParseError):
+        rel_map = {}
+
+    all_sects = list(doc_root.iter(w("sectPr")))
+    first_page_numbered = None  # None = не удалось определить
+    if all_sects:
+        if len(all_sects) == 1:
+            only = all_sects[0]
+            has_title_pg = only.find(w("titlePg")) is not None
+            refs = {r.get(w("type")): rel_map.get(r.get(R_ID)) for r in only.iter(w("footerReference"))}
+            target = refs.get("first") if has_title_pg else refs.get("default")
+            if target:
+                first_page_numbered = footer_has_page(target)
+        else:
+            refs = {r.get(w("type")): rel_map.get(r.get(R_ID))
+                    for r in all_sects[0].iter(w("footerReference"))}
+            targets = [t for t in refs.values() if t]
+            first_page_numbered = any(footer_has_page(t) for t in targets)
+    r.check("title-page-unnumbered",
+            first_page_numbered is False,
+            "no number" if first_page_numbered is False else
+            ("number present" if first_page_numbered else "undetermined"),
+            "no page number on the first page (empty first footer / titlePg)")
 
     # -- 7. styles.xml hygiene after merge -----------------------------------
     # 7a. No same-type duplicate style ids (cross-type dups "-1"/"-2" are a

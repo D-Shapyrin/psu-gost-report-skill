@@ -209,3 +209,5 @@ __marimo__/
 # CI build outputs
 tests/out/
 tests/.*_preprocessed.md
+tests/_scratch/
+tests/__pycache__/

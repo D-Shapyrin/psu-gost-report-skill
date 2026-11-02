@@ -28,6 +28,7 @@
 
 ## Подтверждённые факты
 
+- **Профили вузов не влияют на зависимости.** `templates/<profile>/reference.docx` и титульники — обычные .docx, движку нужны те же pandoc + python-docx + docxcompose. `verify.py <docx> --profile=<name>` читает ожидания (поля, шрифт, интервал, нумерацию страниц) из reference.docx этого профиля; без `--profile` берётся `my`. В этой ревизии verify выполняет 21 проверку (к прежним 18 добавлены: колонтитул с полем PAGE, центрирование номера страницы, отсутствие номера на титуле), поэтому в таблице ниже «18/18» — результаты прогонов до её введения.
 - **pandoc 2.17–3.10 совместим.** Диффы между версиями — косметика таблиц; стили и структура идентичны. На pandoc ≥3.7 сборка печатает deprecation warning про `--highlight-style` — безвреден.
 - **LibreOffice 7.4 переименовывает styleId** при round-trip (BodyText→TextBody, TOC1/2→Contents1/2) — компенсируется `restore_canonical_style_ids()` в update_fields.py; на LO 24.2+ это no-op.
 - **Ubuntu 23+/Debian 12 (PEP 668):** pip только с `--break-system-packages` (или venv — но тогда python-uno недоступен, слой 1 требует системный python3).

@@ -7,6 +7,7 @@ Usage:
 Expects templates/ and filters/ directories next to scripts/.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -23,12 +24,17 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = SKILL_DIR / "templates"
 FILTERS_DIR = SKILL_DIR / "filters"
 
-REFERENCE_DOC = TEMPLATES_DIR / "reference.docx"
-TITLE_PAGES_DIR = TEMPLATES_DIR / "title_pages"
-DEFAULT_TITLE_PAGE = "guap_lab"
+DEFAULT_TITLE_PAGE = "guap_lab"  # крайний фолбэк, если профиль без реестра
 PAGEBREAK_FILTER = FILTERS_DIR / "pagebreak.lua"
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+LEGACY_PROFILE = "from_the_repository"
+DEFAULT_PROFILE = "my"
+PROFILE_DEFAULT_TITLE_PAGE = {
+    DEFAULT_PROFILE: "pgu_lab",
+    LEGACY_PROFILE: "guap_lab",
+}
 
 # Section headings that should be rendered as ГОСТ structural elements
 # (centered, all caps, no numbering). Match by lowercase exact heading text.
@@ -38,6 +44,7 @@ GOST_STRUCTURAL_HEADINGS = {
     "введение",
     "заключение",
     "список использованных источников",
+    "список используемых источников",
     "список литературы",
     "список сокращений",
     "перечень сокращений",
@@ -46,18 +53,67 @@ GOST_STRUCTURAL_HEADINGS = {
 }
 
 
+def profile_for_metadata(metadata: dict) -> str:
+    """University profile: which `templates/<profile>/` package to use.
+
+    Sources (in priority order): YAML key `profile`; env var
+    `GOST_REPORT_PROFILE`; hard default `my` (this checkout's university,
+    ПГУ ИБСТ — see templates/my/). Falls back to `from_the_repository` when
+    the selected profile lacks its own reference.docx/title_pages.
+    """
+    prof = (
+        str(metadata.get("profile", "")).strip()
+        or os.environ.get("GOST_REPORT_PROFILE", "")
+    ).strip()
+    return prof or DEFAULT_PROFILE
+
+
+def templates_dir_for(profile: str) -> Path:
+    return TEMPLATES_DIR / profile
+
+
 def resolve_title_page(metadata: dict) -> Path:
     """Pick the title page template by the `title_page` YAML key.
 
-    Templates live in templates/title_pages/<name>.docx. Falls back to
-    DEFAULT_TITLE_PAGE when the key is absent.
+    Templates live in templates/<profile>/title_pages/<name>.docx. Falls back
+    to the profile's default title page when the key is absent.
     """
-    name = metadata.get("title_page", "").strip() or DEFAULT_TITLE_PAGE
-    path = TITLE_PAGES_DIR / f"{name}.docx"
+    profile = profile_for_metadata(metadata)
+    tdir = templates_dir_for(profile)
+    name = (
+        metadata.get("title_page", "").strip()
+        or PROFILE_DEFAULT_TITLE_PAGE.get(profile, DEFAULT_TITLE_PAGE)
+    )
+    path = tdir / "title_pages" / f"{name}.docx"
+    if path.exists():
+        return path
+    # Fall back to the legacy repository package if this profile has none.
+    legacy = TEMPLATES_DIR / LEGACY_PROFILE / "title_pages" / f"{name}.docx"
+    if legacy.exists():
+        print(f"Note: using legacy title page template {legacy}")
+        return legacy
+    available = sorted(
+        p.stem
+        for p in (tdir / "title_pages").glob("*.docx")
+    ) or sorted(p.stem for p in TEMPLATES_DIR.glob("**/title_pages/*.docx"))
+    print(f"Error: title page template not found: {path}")
+    print(f"Available templates: {', '.join(available) or '(none)'}")
+    sys.exit(1)
+
+
+def resolve_reference_doc(metadata: dict) -> Path:
+    """Styles/geometry carrier for the selected university profile."""
+    profile = profile_for_metadata(metadata)
+    path = templates_dir_for(profile) / "reference.docx"
     if not path.exists():
-        available = sorted(p.stem for p in TITLE_PAGES_DIR.glob("*.docx"))
-        print(f"Error: title page template not found: {path}")
-        print(f"Available templates: {', '.join(available) or '(none)'}")
+        path = TEMPLATES_DIR / LEGACY_PROFILE / "reference.docx"
+        if path.exists():
+            print(f"Note: using legacy reference document {path}")
+    if not path.exists():
+        print(
+            f"Error: reference.docx not found for profile '{profile}' "
+            f"(expected {templates_dir_for(profile) / 'reference.docx'})"
+        )
         sys.exit(1)
     return path
 
@@ -153,8 +209,8 @@ def _override_title_line(doc, placeholders, title_label: str):
             return
 
 
-def transplant_reference_styles(title_path: Path):
-    """Ensure the filled title docx carries the GOST styles from reference.docx.
+def transplant_reference_styles(title_path: Path, reference_doc: Path):
+    """Ensure the filled title docx carries the GOST styles from `reference_doc`.
 
     docxcompose keeps the master document's (= title's) style definitions on
     name clashes, so a title template from a foreign university docx would
@@ -166,7 +222,7 @@ def transplant_reference_styles(title_path: Path):
     # filled title went through, so byte comparison detects a genuine match.
     with tempfile.TemporaryDirectory() as tmp:
         ref_norm = Path(tmp) / "ref_norm.docx"
-        shutil.copy2(REFERENCE_DOC, ref_norm)
+        shutil.copy2(reference_doc, ref_norm)
         ref_doc = Document(str(ref_norm))
         _ = ref_doc.styles  # force styles part to parse
         ref_doc.save(str(ref_norm))
@@ -233,7 +289,7 @@ def preprocess_markdown(md_path: Path, output_path: Path):
     output_path.write_text(text, encoding="utf-8")
 
 
-def build_report_body(md_path: Path, output_path: Path):
+def build_report_body(md_path: Path, output_path: Path, reference_doc: Path):
     preprocessed = md_path.parent / f".{md_path.stem}_preprocessed.md"
     preprocess_markdown(md_path, preprocessed)
     try:
@@ -242,7 +298,7 @@ def build_report_body(md_path: Path, output_path: Path):
             str(preprocessed),
             "-o",
             str(output_path),
-            f"--reference-doc={REFERENCE_DOC}",
+            f"--reference-doc={reference_doc}",
             f"--lua-filter={PAGEBREAK_FILTER}",
             "--highlight-style=pygments",  # выбор владельца 2026-07-16; фиксируем явно от смены дефолта pandoc
         ]
@@ -264,10 +320,23 @@ def _postprocess_body(body_path: Path, metadata: dict):
     add_toc = flag("add_toc")
     number_headings = flag("number_headings")
     sections_new_page = flag("sections_new_page")
+    number_formulas = flag("number_formulas")
+    profile = profile_for_metadata(metadata)
+    lists_style = str(metadata.get("lists_style", "")).strip() or (
+        "pgu" if profile == DEFAULT_PROFILE else "default"
+    )
+    toc_title = str(metadata.get("toc_title", "")).strip() or (
+        "ОГЛАВЛЕНИЕ" if profile == DEFAULT_PROFILE else "СОДЕРЖАНИЕ"
+    )
 
     with zipfile.ZipFile(body_path, "r") as zf:
         names = zf.namelist()
         document_xml = zf.read("word/document.xml").decode("utf-8")
+        numbering_xml = (
+            zf.read("word/numbering.xml").decode("utf-8")
+            if "word/numbering.xml" in names
+            else None
+        )
 
     document_xml = _fix_tables(document_xml)
     document_xml = _fit_table_widths(document_xml)
@@ -277,17 +346,180 @@ def _postprocess_body(body_path: Path, metadata: dict):
         document_xml = _number_headings(document_xml)
     if sections_new_page:
         document_xml = _sections_new_page(document_xml)
+    if number_formulas:
+        document_xml = _number_formulas(document_xml, metadata)
+    if lists_style == "pgu":
+        document_xml, numbering_xml = _fix_lists(document_xml, numbering_xml)
     if add_toc:
-        document_xml = _insert_toc_field(document_xml)
+        document_xml = _insert_toc_field(document_xml, toc_title)
 
     # Repack
     with zipfile.ZipFile(body_path, "r") as zin:
         files = {n: zin.read(n) for n in names}
     files["word/document.xml"] = document_xml.encode("utf-8")
+    if numbering_xml is not None:
+        files["word/numbering.xml"] = numbering_xml.encode("utf-8")
     body_path.unlink()
     with zipfile.ZipFile(body_path, "w", zipfile.ZIP_DEFLATED) as zout:
         for n, data in files.items():
             zout.writestr(n, data)
+
+
+# -- ПГУ ИБСТ: перечисления (дефис / а) / 1)) и формулы ---------------------
+
+def _fix_lists(document_xml: str, numbering_xml):
+    """Привести перечисления к требованиям кафедры ИБСТ ПГУ:
+
+    - маркированный список — только дефис «–» с абзацного отступа;
+    - нумерованный список — буквы русского алфавита «а) б) в)» на первом
+      уровне, арабские цифры «1) 2)» на вложенном (не более двух уровней).
+
+    Правит w:lvl/w:lvlText/w:numFmt/w:ind в word/numbering.xml; абзацы не
+    трогает, поэтому нумерация остаётся «живой» (Word пересчитывает сам).
+    Возвращает (document_xml, numbering_xml); numbering_xml может быть None.
+    """
+    if numbering_xml is None:
+        return document_xml, numbering_xml
+
+    def fix_lvl(block: str, ilvl: str, kind: str) -> str:
+        if kind == "dash":
+            fmt, text = "bullet", "–"
+        elif kind == "letter":
+            fmt, text = "russianLower", "%" + str(ilvl + 1) + ")"
+        else:
+            fmt, text = "decimal", "%" + str(ilvl + 1) + ")"
+
+        block = re.sub(r'<w:numFmt w:val="[^"]*"\s*/>',
+                       f'<w:numFmt w:val="{fmt}"/>', block, count=1)
+        if "<w:lvlText" in block:
+            block = re.sub(r'<w:lvlText w:val="[^"]*"\s*/>',
+                           f'<w:lvlText w:val="{text}"/>', block, count=1)
+        else:
+            block = block.replace("</w:lvl>",
+                                  f'<w:lvlText w:val="{text}"/></w:lvl>', 1)
+        # Маркер — с абзацного отступа 1,25 см, текст продолжается на 1,25 см.
+        ind = '<w:ind w:left="1418" w:hanging="709"/>'
+        if re.search(r'<w:ind[^/]*/>', block):
+            block = re.sub(r'<w:ind[^/]*/>', ind, block, count=1)
+        elif "<w:pPr>" in block:
+            block = block.replace("<w:pPr>", "<w:pPr>" + ind, 1)
+        # Шрифт маркера — Times New Roman (pandoc ставит Symbol/Wingdings)
+        block = re.sub(r'<w:rFonts[^/]*/>',
+                       '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>',
+                       block)
+        return block
+
+    def process_abstract(m: re.Match) -> str:
+        abstract = m.group(0)
+        lvl0 = re.search(r'<w:lvl w:ilvl="0">.*?</w:lvl>', abstract, re.S)
+        if not lvl0:
+            return abstract
+        is_bullet = 'w:val="bullet"' in lvl0.group(0)
+        is_number = re.search(
+            r'<w:numFmt w:val="(decimal|lowerLetter|lowerRoman|upperLetter|upperRoman)"',
+            abstract,
+        ) is not None
+        if not (is_bullet or is_number):
+            return abstract
+
+        def fix_one(lm: re.Match) -> str:
+            ilvl = int(lm.group(1))
+            kind = "dash" if is_bullet else "letter"
+            if ilvl > 0:
+                kind = "digit"
+            return fix_lvl(lm.group(0), ilvl, kind)
+
+        return re.sub(r'<w:lvl w:ilvl="(\d+)">.*?</w:lvl>', fix_one, abstract, flags=re.S)
+
+    numbering_xml = re.sub(
+        r'<w:abstractNum [^>]*>.*?</w:abstractNum>',
+        process_abstract,
+        numbering_xml,
+        flags=re.S,
+    )
+    return document_xml, numbering_xml
+
+
+def _text_width_twips(document_xml: str, default: int = 9638) -> int:
+    """Ширина рабочей области (страница минус поля) по последнему sectPr."""
+    sects = re.findall(r'<w:sectPr[^>]*>.*?</w:sectPr>', document_xml, re.S)
+    if not sects:
+        return default
+    sect = sects[-1]
+    pgsz = re.search(r'<w:pgSz[^/]*/>', sect)
+    mar = re.search(r'<w:pgMar[^/]*/>', sect)
+    if not pgsz or not mar:
+        return default
+
+    def attr(el: str, name: str):
+        m = re.search(r'w:%s="(\d+)"' % name, el)
+        return int(m.group(1)) if m else None
+
+    page_w = attr(pgsz.group(0), "w")
+    left = attr(mar.group(0), "left")
+    right = attr(mar.group(0), "right")
+    if page_w is None or left is None or right is None:
+        return default
+    width = page_w - left - right
+    return width if width > 3000 else default
+
+
+def _number_formulas(document_xml: str, metadata: dict) -> str:
+    """Пронумеровать выключные формулы: «(1)» справа от формулы.
+
+    Формула — абзац, единственное содержимое которого m:oMathPara (так pandoc
+    выводит `$$...$$`). Нумерация сквозная; в приложениях «(А.1)» — по букве
+    текущего приложения. Ссылки в тексте («в формуле (1)») пишет автор.
+    """
+    right_tab = _text_width_twips(document_xml)
+    counter = {"n": 0}
+    state = {"appendix": None, "appendix_n": 0}
+
+    def is_pure_formula(p: str) -> bool:
+        body = re.sub(r'<w:pPr>.*?</w:pPr>', '', p, flags=re.S)
+        if "oMathPara" not in body:
+            return False
+        return not re.search(r'<w:r[ >]', body) and not re.search(r'<w:t[ >]', body)
+
+    out, pos = [], 0
+    for m in _PARA_RE.finditer(document_xml):
+        out.append(document_xml[pos:m.start()])
+        p = m.group(0)
+
+        text = _para_text(p).strip().lower()
+        app = re.fullmatch(r"приложение\s+([а-яё])", text)
+        if app and _para_heading_level(p) is not None:
+            state["appendix"] = app.group(1)
+            state["appendix_n"] = 0
+
+        if is_pure_formula(p):
+            if state["appendix"]:
+                state["appendix_n"] += 1
+                label = f"{state['appendix'].upper()}.{state['appendix_n']}"
+            else:
+                counter["n"] += 1
+                label = str(counter["n"])
+
+            number_run = (
+                '<w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>'
+                '<w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>'
+                f'<w:tab/><w:t xml:space="preserve">({label})</w:t></w:r>'
+            )
+            tabs = ('<w:tabs><w:tab w:val="center" w:pos="%d"/>'
+                    '<w:tab w:val="right" w:pos="%d"/></w:tabs>'
+                    % (right_tab // 2, right_tab))
+            # OOXML pPr child order: pStyle must stay first, then tabs.
+            ppr_anchor = re.search(r'<w:pPr>(?:\s*<w:pStyle[^/]*/>)?', p)
+            if ppr_anchor:
+                p = p[:ppr_anchor.end()] + tabs + p[ppr_anchor.end():]
+            else:
+                p = p.replace("<w:p>", "<w:p><w:pPr>" + tabs + "</w:pPr>", 1)
+            p = re.sub(r'<w:jc[^/]*/>', '<w:jc w:val="center"/>', p, count=1)
+            p = p.replace("</w:p>", number_run + "</w:p>", 1)
+        out.append(p)
+        pos = m.end()
+    out.append(document_xml[pos:])
+    return "".join(out)
 
 
 def _fix_tables(document_xml: str) -> str:
@@ -622,10 +854,12 @@ def _center_appendix_titles(document_xml: str) -> str:
     return "".join(out)
 
 
-def _insert_toc_field(document_xml: str) -> str:
+def _insert_toc_field(document_xml: str, toc_title: str = "СОДЕРЖАНИЕ") -> str:
     """Insert an automatic Word TOC field. Placed at the very start of the
     body, or — when the document opens with РЕФЕРАТ/АННОТАЦИЯ (ВКР) — right
     after that section, per ГОСТ 7.32 element order.
+
+    `toc_title` — heading text above the field (ПГУ ИБСТ требует «ОГЛАВЛЕНИЕ»).
     """
     if 'TOC \\o' in document_xml:
         return document_xml  # already inserted
@@ -634,7 +868,7 @@ def _insert_toc_field(document_xml: str) -> str:
         # Heading line
         '<w:p><w:pPr><w:pStyle w:val="UnnumberedHeading1NoTOC1"/>'
         '<w:jc w:val="center"/></w:pPr>'
-        '<w:r><w:t xml:space="preserve">СОДЕРЖАНИЕ</w:t></w:r></w:p>'
+        f'<w:r><w:t xml:space="preserve">{toc_title}</w:t></w:r></w:p>'
         # TOC field
         '<w:p><w:pPr><w:pStyle w:val="BodyText"/></w:pPr>'
         '<w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/>'
@@ -667,6 +901,165 @@ def _insert_toc_field(document_xml: str) -> str:
     )
 
 
+def normalize_final_sections(output_path: Path, reference_doc: Path):
+    """Привести геометрию и нумерацию страниц итогового .docx к профилю.
+
+    После docxcompose в документе может остаться sectPr титульного шаблона
+    (свои поля, свой нижний колонтитул). Для профиля вуза правильна геометрия
+    reference.docx, а нумерация должна быть сквозной с титульного листа и
+    без номера на самом титуле. Функция:
+      * ставит pgSz/pgMar из reference.docx во все секции;
+      * последней секции — <w:titlePg/> и нумерацию с 1 (титул считается);
+      * гарантирует наличие колонтитула с полем PAGE (берёт из reference.docx);
+      * первой секции (титул) — пустой колонтитул, чтобы номера не было.
+    Идемпотентна.
+    """
+    with zipfile.ZipFile(reference_doc) as zref:
+        ref_doc_xml = zref.read("word/document.xml").decode("utf-8")
+        ref_sect = re.search(r'<w:sectPr[^>]*>.*?</w:sectPr>', ref_doc_xml, re.S)
+        if not ref_sect:
+            print("Warning: reference.docx has no sectPr — page geometry not normalized")
+            return
+        ref_sect = ref_sect.group(0)
+        ref_pgsz = re.search(r'<w:pgSz[^/]*/>', ref_sect)
+        ref_pgmar = re.search(r'<w:pgMar[^/]*/>', ref_sect)
+
+        footer_parts = {}
+        for name in zref.namelist():
+            if re.fullmatch(r"word/footer\d*\.xml", name):
+                footer_parts[name] = zref.read(name)
+
+    page_footer = None   # footer XML that carries the PAGE field
+    for data in footer_parts.values():
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if re.search(r'<w:instrText[^>]*>\s*PAGE\b', text):
+            page_footer = text
+            break
+    if page_footer is None:
+        # Минимальный колонтитул: номер страницы по центру нижнего поля.
+        page_footer = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:p><w:pPr><w:pStyle w:val="Footer"/><w:jc w:val="center"/></w:pPr>'
+            '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+            '<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+            '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+            '<w:r><w:t>1</w:t></w:r>'
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+            '</w:p></w:ftr>'
+        )
+    empty_footer = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<w:p><w:pPr><w:pStyle w:val="Footer"/></w:pPr>'
+        '<w:r><w:rPr/></w:r></w:p></w:ftr>'
+    )
+
+    with zipfile.ZipFile(output_path, "r") as zf:
+        names = zf.namelist()
+        files = {n: zf.read(n) for n in names}
+
+    document_xml = files["word/document.xml"].decode("utf-8")
+    rels_xml = files["word/_rels/document.xml.rels"].decode("utf-8")
+    ct_xml = files["[Content_Types].xml"].decode("utf-8")
+
+    # -- ensure two footer parts: numbered + empty --------------------------
+    def ensure_part(target: str, payload: str) -> str:
+        """Write word/<target> if missing; register rel + content type."""
+        nonlocal rels_xml, ct_xml
+        part_name = f"word/{target}"
+        if part_name not in files:
+            files[part_name] = payload.encode("utf-8")
+        if f'Target="{target}"' not in rels_xml:
+            used = {int(m) for m in re.findall(r'Id="rId(\d+)"', rels_xml)}
+            new_id = f"rId{max(used or {0}) + 1}"
+            rels_xml = rels_xml.replace(
+                "</Relationships>",
+                f'<Relationship Id="{new_id}" Type="http://schemas.openxmlformats.org/'
+                f'officeDocument/2006/relationships/footer" Target="{target}"/></Relationships>',
+            )
+        if f'PartName="/{part_name}"' not in ct_xml:
+            ct_xml = ct_xml.replace(
+                "</Types>",
+                f'<Override PartName="/{part_name}" ContentType="application/'
+                'vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>',
+            )
+        m = re.search(r'Id="(rId\d+)"[^>]*Target="%s"' % re.escape(target), rels_xml)
+        return m.group(1) if m else ""
+
+    numbered_id = ensure_part("footer_page.xml", page_footer)
+    empty_id = ensure_part("footer_blank.xml", empty_footer)
+
+    # -- sectPr fixes -------------------------------------------------------
+    sects = list(re.finditer(r'<w:sectPr[^>]*>.*?</w:sectPr>', document_xml, re.S))
+    single_section = len(sects) == 1
+
+    def fix_sect(m: re.Match, is_last: bool) -> str:
+        sect = m.group(0)
+        if ref_pgsz:
+            sect = re.sub(r'<w:pgSz[^/]*/>', ref_pgsz.group(0), sect, count=1)
+        if ref_pgmar:
+            sect = re.sub(r'<w:pgMar[^/]*/>', ref_pgmar.group(0), sect, count=1)
+
+        numbered_here = is_last  # only the body section is numbered
+        sect = re.sub(r'<w:footerReference[^/]*/>', '', sect)
+        refs = []
+        for ftype in ("even", "default", "first"):
+            # Первая страница раздела («first») — титул, номера на нём нет.
+            if numbered_here and ftype != "first":
+                refs.append(f'<w:footerReference w:type="{ftype}" r:id="{numbered_id}"/>')
+            else:
+                refs.append(f'<w:footerReference w:type="{ftype}" r:id="{empty_id}"/>')
+        insert_at = sect.find(">") + 1
+        sect = sect[:insert_at] + "".join(refs) + sect[insert_at:]
+
+        if numbered_here:
+            if single_section:
+                # Единственная секция: титул — её первая страница.
+                if "<w:titlePg" not in sect:
+                    sect = sect.replace("</w:sectPr>", "<w:titlePg/></w:sectPr>", 1)
+                if "<w:pgNumType" in sect:
+                    sect = re.sub(r'<w:pgNumType[^/]*/>',
+                                  '<w:pgNumType w:start="1" w:fmt="decimal"/>',
+                                  sect, count=1)
+                else:
+                    sect = sect.replace(
+                        "</w:sectPr>",
+                        '<w:pgNumType w:start="1" w:fmt="decimal"/></w:sectPr>', 1)
+            else:
+                # Отдельная секция тела: титул в своей секции, номера страниц
+                # сквозные — счёт продолжаем (pgNumType без start), а
+                # titlePg здесь НЕ ставим: иначе первая страница тела
+                # (= стр. 2) осталась бы без номера.
+                sect = re.sub(r'<w:titlePg[^/]*/>', '', sect, count=1)
+                sect = re.sub(r'<w:pgNumType[^/]*/>',
+                              '<w:pgNumType w:fmt="decimal"/>', sect, count=1)
+        else:
+            if "<w:titlePg" not in sect:
+                sect = sect.replace("</w:sectPr>", "<w:titlePg/></w:sectPr>", 1)
+            sect = re.sub(r'<w:pgNumType[^/]*/>', '', sect)
+        return sect
+
+    for i, m in enumerate(sects):
+        document_xml = document_xml.replace(
+            m.group(0), fix_sect(m, i == len(sects) - 1), 1
+        )
+
+    files["word/document.xml"] = document_xml.encode("utf-8")
+    files["word/_rels/document.xml.rels"] = rels_xml.encode("utf-8")
+    files["[Content_Types].xml"] = ct_xml.encode("utf-8")
+
+    output_path.unlink()
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for n, data in files.items():
+            zout.writestr(n, data)
+
+
 def fill_report_stats(md_path: Path, body_path: Path, final_path: Path) -> bool:
     """Substitute реферат statistics placeholders in the final docx.
 
@@ -688,7 +1081,7 @@ def fill_report_stats(md_path: Path, body_path: Path, final_path: Path) -> bool:
 
     sources = 0
     m = re.search(
-        r"(?mis)^#\s+список использованных источников\s*$(.*?)(?=^#\s|\Z)", md
+        r"(?mis)^#\s+список\s+(?:использованных|используемых)\s+источников\s*$(.*?)(?=^#\s|\Z)", md
     )
     if m:
         sources = len(re.findall(r"(?m)^\s*\d+\.\s", m.group(1)))
@@ -767,21 +1160,24 @@ def main():
     metadata = parse_yaml_front_matter(md_path)
     print(f"Metadata: {metadata}")
 
+    reference_doc = resolve_reference_doc(metadata)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
         title_template = resolve_title_page(metadata)
         filled = tmpdir / "filled.docx"
         fill_title_page(title_template, metadata, filled)
-        transplant_reference_styles(filled)
+        transplant_reference_styles(filled, reference_doc)
         print(f"Title page filled ({title_template.stem})")
 
         body_docx = tmpdir / "body.docx"
-        build_report_body(md_path, body_docx)
+        build_report_body(md_path, body_docx, reference_doc)
         _postprocess_body(body_docx, metadata)
         print("Report body built")
 
         merge_documents(filled, body_docx, output_path)
+        normalize_final_sections(output_path, reference_doc)
         stats_used = fill_report_stats(md_path, body_docx, output_path)
         print(f"Report saved: {output_path}")
 
