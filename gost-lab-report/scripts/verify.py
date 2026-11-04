@@ -150,14 +150,15 @@ class Expect:
             return self
 
         styles = Styles(styles_root)
-        self.font = styles.resolve("Normal", pick_rpr_font) or self.font
-        self.sz = _int(styles.resolve("Normal", pick_rpr_sz)) or self.sz
-        sp = styles.resolve("Normal", pick_ppr_spacing)
+        self.font = styles.resolve(normal_sid(styles), pick_rpr_font) or self.font
+        self.sz = _int(styles.resolve(normal_sid(styles), pick_rpr_sz)) or self.sz
+        sp = styles.resolve(normal_sid(styles), pick_ppr_spacing)
         if sp and _int(sp[0]):
             self.line = _int(sp[0])
             self.line_rule = sp[1] or self.line_rule
-        self.jc = styles.resolve("Normal", pick_ppr_jc) or self.jc
-        for sid in ("BodyText", "FirstParagraph1"):
+        self.jc = styles.resolve(normal_sid(styles), pick_ppr_jc) or self.jc
+        for sid in (style_by_name(styles, "Body Text") or "BodyText",
+                style_by_name(styles, "First Paragraph") or "FirstParagraph1"):
             fl = _int(styles.resolve(sid, pick_ppr_first_line))
             if fl is not None:
                 self.first_line = fl
@@ -231,6 +232,27 @@ class Styles:
             if val is not None:
                 return val
         return None
+
+
+
+# В reference.docx профиля "my" стиль Normal записан под авто-id "a"
+# (источник — бланк кафедры), поэтому ищем стиль по имени, а не по id.
+def style_by_name(styles, name):
+    for el in styles.by_id.values():
+        nm = el.find(w("name"))
+        if nm is not None and nm.get(w("val")) == name:
+            return el.get(w("styleId"))
+    return None
+
+
+def normal_sid(styles):
+    sid = style_by_name(styles, "Normal")
+    if sid:
+        return sid
+    for el in styles.by_id.values():
+        if el.get(w("default")) in ("1", "true", "on"):
+            return el.get(w("styleId"))
+    return "Normal"
 
 
 def _bool_attr(el):
@@ -361,7 +383,12 @@ def main():
     r = Runner()
 
     # -- 1. Transplanted GOST styles survived the merge --------------------
-    missing = [sid for sid in REQUIRED_STYLE_IDS if styles.get(sid) is None]
+    REQ_NAMES = {"Normal": "Normal", "BodyText": "Body Text", "FirstParagraph1": "First Paragraph",
+                 "Compact1": "Compact", "Heading1": "heading 1", "Heading2": "heading 2",
+                 "Heading3": "heading 3", "SourceCode1": "Source Code", "VerbatimChar": "Verbatim Char",
+                 "TableCaption1": "Table Caption", "UnnumberedHeading1NoTOC1": "UnnumberedHeading1NoTOC"}
+    missing = [sid for sid in REQUIRED_STYLE_IDS
+               if styles.get(sid) is None and style_by_name(styles, REQ_NAMES.get(sid, sid)) is None]
     r.check(
         "gost-styles-present",
         not missing,
@@ -370,14 +397,14 @@ def main():
     )
 
     # -- 2. Normal: font / size / line spacing / justification -------------
-    font = styles.resolve("Normal", pick_rpr_font)
+    font = styles.resolve(normal_sid(styles), pick_rpr_font)
     r.check("normal-font", font == exp.font, font, exp.font)
 
-    sz = _int(styles.resolve("Normal", pick_rpr_sz))
+    sz = _int(styles.resolve(normal_sid(styles), pick_rpr_sz))
     r.check("normal-size", sz == exp.sz,
             f"{sz} half-points" if sz else sz, f"{exp.sz} half-points (14 pt)")
 
-    spacing = styles.resolve("Normal", pick_ppr_spacing)
+    spacing = styles.resolve(normal_sid(styles), pick_ppr_spacing)
     ok = (
         spacing is not None
         and _int(spacing[0]) == exp.line
@@ -387,11 +414,12 @@ def main():
             f"line={spacing[0]} rule={spacing[1]}" if spacing else None,
             f"line={exp.line} rule={exp.line_rule} (1.5 spacing)")
 
-    jc = styles.resolve("Normal", pick_ppr_jc)
+    jc = styles.resolve(normal_sid(styles), pick_ppr_jc)
     r.check("normal-justified", jc == exp.jc, jc, exp.jc)
 
     # -- 3. Red line: first-line indent 1.25 cm on body styles -------------
-    for sid in ("BodyText", "FirstParagraph1"):
+    for sid in (style_by_name(styles, "Body Text") or "BodyText",
+                style_by_name(styles, "First Paragraph") or "FirstParagraph1"):
         fl = styles.resolve(sid, pick_ppr_first_line)
         fl_int = _int(fl)
         ok = (
@@ -403,12 +431,15 @@ def main():
                 f"{exp.first_line} twips (1.25 cm)")
 
     # -- 4. Headings resolve to bold ----------------------------------------
-    for sid in ("Heading1", "Heading2", "Heading3"):
+    for sid in (style_by_name(styles, "heading 1") or "Heading1",
+                style_by_name(styles, "heading 2") or "Heading2",
+                style_by_name(styles, "heading 3") or "Heading3"):
         bold = styles.resolve(sid, pick_rpr_bold) if styles.get(sid) is not None else None
         r.check(f"heading-bold[{sid}]", bold is True, bold, "True (bold)")
 
     # -- 5. Source Code / inline code are monospace -------------------------
-    for sid, label in (("SourceCode1", "Source Code"), ("VerbatimChar", "Verbatim Char")):
+    for sid, label in ((style_by_name(styles, "Source Code") or "SourceCode1", "Source Code"),
+                       (style_by_name(styles, "Verbatim Char") or "VerbatimChar", "Verbatim Char")):
         f = styles.resolve(sid, pick_rpr_font) if styles.get(sid) is not None else None
         r.check(f"monospace[{label}]", f in MONOSPACE_FONTS, f,
                 f"one of {sorted(MONOSPACE_FONTS)}")
@@ -568,7 +599,7 @@ def main():
 
     # 8b. The body is actually bound to the GOST styles (not re-tagged to the
     #     title document's defaults during the merge).
-    body_bound = any(ref in ("BodyText", "FirstParagraph1") for ref in refs)
+    body_bound = any(ref in (style_by_name(styles, "Body Text"), style_by_name(styles, "First Paragraph")) for ref in refs)
     r.check("body-uses-gost-styles", body_bound,
             f"pStyle refs: {', '.join(refs) or 'none'}",
             "at least one paragraph styled BodyText/FirstParagraph1")
