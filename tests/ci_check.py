@@ -53,6 +53,43 @@ def document_xml(docx_path):
         return z.read("word/document.xml").decode("utf-8", errors="replace")
 
 
+HEADING_PARA_RE = re.compile(r"<w:p\b[^/>]*?>(?:(?!</w:p>).)*?</w:p>", re.DOTALL)
+
+
+def heading_texts(docx_path):
+    """Тексты заголовков уровня 1-3 в порядке документа.
+
+    Уровень определяется по имени стиля в styles.xml: профиль ПГУ хранит
+    заголовки под авто-id («1», «2», «3») — именно на этом уже ломалась
+    нумерация (регресс ловил только человек).
+    """
+    with zipfile.ZipFile(docx_path) as z:
+        xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+        styles = (
+            z.read("word/styles.xml").decode("utf-8", errors="replace")
+            if "word/styles.xml" in z.namelist()
+            else ""
+        )
+    levels = {}
+    for block in re.findall(r"<w:style [^>]*>.*?</w:style>", styles, re.DOTALL):
+        sid = re.search(r'w:styleId="([^"]*)"', block)
+        name = re.search(r'<w:name w:val="heading\s*([1-9])"', block, re.I)
+        if sid and name:
+            levels[sid.group(1)] = int(name.group(1))
+    texts = []
+    for p in HEADING_PARA_RE.findall(xml):
+        sid = re.search(r'w:pStyle w:val="([^"]*)"', p)
+        if not sid:
+            continue
+        level = levels.get(sid.group(1))
+        if level is None:
+            m = re.fullmatch(r"Heading([1-9])", sid.group(1))
+            level = int(m.group(1)) if m else None
+        if level is not None:
+            texts.append("".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", p)))
+    return texts
+
+
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in ("--expect-toc", "--expect-degraded"):
         print(__doc__)
@@ -81,6 +118,19 @@ def main():
         vproc = run([VERIFY, out, f"--profile={profile}"])
         if vproc.returncode != 0:
             failures.append(f"verify {name}: exit {vproc.returncode}")
+
+        # number_headings=true меняет только заголовки: первое слово каждого
+        # должно стать номером «N» или «N.N» (структурные элементы вроде
+        # «ВВЕДЕНИЕ» не нумеруются — их отсутствие номера не претензия).
+        if str(meta.get("number_headings", "")).lower() in ("true", "yes", "1"):
+            heads = heading_texts(out)
+            numbered = [h for h in heads if re.match(r"^\d+(\.\d+)*\s", h)]
+            if heads and not numbered:
+                failures.append(
+                    f"numbering {name}: ни один заголовок не пронумерован "
+                    f"({heads[:3]}...) — проверь number_headings/_heading_style_ids"
+                )
+            print(f"numbering {name}: {len(numbered)}/{len(heads)} headings numbered")
 
     # Режим оглавления проверяем на документах с add_toc=true
     toc_docs = [

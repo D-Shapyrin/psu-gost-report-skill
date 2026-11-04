@@ -318,7 +318,9 @@ def _postprocess_body(body_path: Path, metadata: dict):
         return str(metadata.get(name, "")).strip().lower() in ("true", "yes", "1")
 
     add_toc = flag("add_toc")
-    number_headings = flag("number_headings")
+    # NB: не называть локальную переменную как функцию (_number_headings):
+    # присваивание в теле делает её локальным именем и затеняет функцию.
+    do_number_headings = flag("number_headings")
     sections_new_page = flag("sections_new_page")
     number_formulas = flag("number_formulas")
     profile = profile_for_metadata(metadata)
@@ -337,15 +339,20 @@ def _postprocess_body(body_path: Path, metadata: dict):
             if "word/numbering.xml" in names
             else None
         )
+        heading_styles = _heading_style_ids(
+            zf.read("word/styles.xml").decode("utf-8")
+            if "word/styles.xml" in names
+            else ""
+        )
 
     document_xml = _fix_tables(document_xml)
     document_xml = _fit_table_widths(document_xml)
-    document_xml = _fix_structural_headings(document_xml)
-    document_xml = _center_appendix_titles(document_xml)
-    if number_headings:
-        document_xml = _number_headings(document_xml)
+    document_xml = _fix_structural_headings(document_xml, heading_styles)
+    document_xml = _center_appendix_titles(document_xml, heading_styles)
+    if do_number_headings:
+        document_xml = _number_headings(document_xml, heading_styles)
     if sections_new_page:
-        document_xml = _sections_new_page(document_xml)
+        document_xml = _sections_new_page(document_xml, heading_styles)
     if number_formulas:
         document_xml = _number_formulas(document_xml, metadata)
     if lists_style == "pgu":
@@ -712,15 +719,15 @@ def _center_row_paragraphs(row_xml: str) -> str:
     return re.sub(r'<w:p\b[^/]*?>(?:(?!</w:p>).)*?</w:p>', fix_para, row_xml, flags=re.DOTALL)
 
 
-def _fix_structural_headings(document_xml: str) -> str:
+def _fix_structural_headings(document_xml: str, heading_styles=None) -> str:
     """For headings whose text matches a ГОСТ structural section name, replace
     the heading style with a centered all-caps version, drop heading numbering,
     and uppercase the run text."""
 
     def process_para(m: re.Match) -> str:
         p = m.group(0)
-        style_match = re.search(r'<w:pStyle w:val="(Heading[1-9])"', p)
-        if not style_match:
+        style_match = re.search(r'<w:pStyle w:val="([^"]*)"', p)
+        if not style_match or _heading_level(style_match.group(1), heading_styles) is None:
             return p
         # Extract plain text
         texts = re.findall(r'<w:t[^>]*>([^<]*)</w:t>', p)
@@ -744,11 +751,50 @@ def _fix_structural_headings(document_xml: str) -> str:
 
 _PARA_RE = re.compile(r"<w:p\b[^/>]*?>(?:(?!</w:p>).)*?</w:p>", re.DOTALL)
 
+# Глубина нумерации заголовков («1», «1.1», «1.1.1»); глубже не нумеруем.
+MAX_HEADING_LEVEL = 3
 
-def _para_heading_level(p_xml: str):
-    """Return heading level (1-3) for a paragraph, or None."""
-    m = re.search(r'<w:pStyle w:val="Heading([1-3])"', p_xml)
+
+def _heading_style_ids(styles_xml: str):
+    """Map heading level -> styleId, as serialized in word/styles.xml.
+
+    Профили кафедры (templates/my/reference.docx) пришли из Word и хранят
+    авто-id («1», «2», «3», Normal = «a»), а не канонические «Heading1».
+    Поэтому уровни заголовков ищем по имени стиля («heading N»), а не по id —
+    иначе нумерация разделов и структурные заголовки молча не срабатывают.
+    """
+    mapping = {}
+    for block in re.findall(r"<w:style [^>]*>.*?</w:style>", styles_xml, re.S):
+        sid = re.search(r'w:styleId="([^"]*)"', block)
+        if not sid:
+            continue
+        for name in re.findall(r'<w:name w:val="([^"]*)"', block):
+            m = re.fullmatch(r"heading\s*([1-9])", name.strip(), re.I)
+            if m and int(m.group(1)) <= MAX_HEADING_LEVEL:
+                mapping[int(m.group(1))] = sid.group(1)
+    for level in range(1, MAX_HEADING_LEVEL + 1):
+        mapping.setdefault(level, f"Heading{level}")
+    return mapping
+
+
+def _heading_level(style_id: str, heading_styles=None):
+    """Heading level (1-3) for a styleId of a paragraph, or None."""
+    if not style_id:
+        return None
+    mapping = heading_styles or {
+        level: f"Heading{level}" for level in range(1, MAX_HEADING_LEVEL + 1)
+    }
+    for level in range(1, MAX_HEADING_LEVEL + 1):
+        if style_id == mapping.get(level):
+            return level
+    m = re.fullmatch(r"Heading([1-9])", style_id)  # канонические id / чужие docx
     return int(m.group(1)) if m else None
+
+
+def _para_heading_level(p_xml: str, heading_styles=None):
+    """Return heading level (1-3) for a paragraph, or None."""
+    m = re.search(r'<w:pStyle w:val="([^"]*)"', p_xml)
+    return _heading_level(m.group(1), heading_styles) if m else None
 
 
 def _para_text(p_xml: str) -> str:
@@ -760,17 +806,17 @@ def _is_unnumbered_heading(text: str) -> bool:
     return plain in GOST_STRUCTURAL_HEADINGS or plain.startswith("приложение ")
 
 
-def _number_headings(document_xml: str) -> str:
+def _number_headings(document_xml: str, heading_styles=None) -> str:
     """Prefix Heading1-3 text with ГОСТ 7.32 numbers («1 Название», «1.1 …»).
 
     Structural headings (введение, заключение, …) and приложения are skipped.
     Numbers are inserted as plain text so the .docx stays fully static.
     """
-    counters = [0, 0, 0]
+    counters = [0] * MAX_HEADING_LEVEL
 
     def process(m: re.Match) -> str:
         p = m.group(0)
-        level = _para_heading_level(p)
+        level = _para_heading_level(p, heading_styles)
         if level is None:
             return p
         text = _para_text(p)
@@ -779,7 +825,7 @@ def _number_headings(document_xml: str) -> str:
         if re.match(r"^\s*\d+(\.\d+)*\s", text):
             return p  # автор уже пронумеровал — не дублируем
         counters[level - 1] += 1
-        for i in range(level, 3):
+        for i in range(level, MAX_HEADING_LEVEL):
             counters[i] = 0
         number = ".".join(str(c) for c in counters[:level])
         return re.sub(
@@ -792,7 +838,7 @@ def _number_headings(document_xml: str) -> str:
     return _PARA_RE.sub(process, document_xml)
 
 
-def _sections_new_page(document_xml: str) -> str:
+def _sections_new_page(document_xml: str, heading_styles=None) -> str:
     """Give every Heading1 a pageBreakBefore (each section starts on a new
     page, ГОСТ 7.32). Skipped for the first paragraph of the body and for
     headings already preceded by an explicit page break (agent's \\newpage)."""
@@ -803,7 +849,7 @@ def _sections_new_page(document_xml: str) -> str:
     for m in paras:
         p = m.group(0)
         out.append(document_xml[last_end:m.start()])
-        if _para_heading_level(p) == 1 and prev_p is not None:
+        if _para_heading_level(p, heading_styles) == 1 and prev_p is not None:
             prev_is_break = (
                 'w:type="page"' in prev_p and not _para_text(prev_p).strip()
             )
@@ -825,7 +871,7 @@ def _sections_new_page(document_xml: str) -> str:
     return "".join(out)
 
 
-def _center_appendix_titles(document_xml: str) -> str:
+def _center_appendix_titles(document_xml: str, heading_styles=None) -> str:
     """ГОСТ 7.32: заголовок приложения — отдельной строкой по центру. Центрирует
     первый обычный параграф сразу после заголовка «ПРИЛОЖЕНИЕ X»."""
     paras = list(_PARA_RE.finditer(document_xml))
@@ -834,7 +880,7 @@ def _center_appendix_titles(document_xml: str) -> str:
     for m in paras:
         p = m.group(0)
         out.append(document_xml[last_end:m.start()])
-        if prev_was_appendix and _para_heading_level(p) is None and _para_text(p).strip():
+        if prev_was_appendix and _para_heading_level(p, heading_styles) is None and _para_text(p).strip():
             if re.search(r"<w:jc[^/]*/>", p):
                 p = re.sub(r"<w:jc[^/]*/>", '<w:jc w:val="center"/>', p, count=1)
             elif "<w:pPr>" in p:
@@ -845,7 +891,7 @@ def _center_appendix_titles(document_xml: str) -> str:
         else:
             plain = _para_text(p).strip().lower()
             prev_was_appendix = (
-                _para_heading_level(p) is not None
+                _para_heading_level(p, heading_styles) is not None
                 and re.fullmatch(r"приложение\s+[а-яё]", plain) is not None
             )
         out.append(p)
