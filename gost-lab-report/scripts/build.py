@@ -358,7 +358,9 @@ def build_report_body(md_path: Path, output_path: Path, reference_doc: Path):
             str(output_path),
             f"--reference-doc={reference_doc}",
             f"--lua-filter={PAGEBREAK_FILTER}",
-            "--highlight-style=pygments",  # выбор владельца 2026-07-16; фиксируем явно от смены дефолта pandoc
+            # monochrome: Распоряжение кафедры ИБСТ — «только чёрный цвет»
+            # шрифта, цветная подсветка pygments (выбор 2026-07-16) ему противоречит
+            "--highlight-style=monochrome",
         ]
         subprocess.run(cmd, check=True, cwd=md_path.parent)
     finally:
@@ -449,6 +451,23 @@ def _fix_lists(document_xml: str, numbering_xml):
     if numbering_xml is None:
         return document_xml, numbering_xml
 
+    # Список использованных источников нумеруется арабскими цифрами
+    # (ГОСТ 7.32, ГОСТ Р 7.0.5-2008) — перечисления «а) б) в)» на него не
+    # распространяются. Собираем numIds абзацев из секции источников и
+    # исключаем их абстрактные нумерации из перекраски.
+    exempt_abs = set()
+    src_m = re.search(
+        r"СПИСОК ИСПОЛЬЗ[УО]ЕМЫ?Х ИСТОЧНИКОВ|Список (?:используемых|использованных) источников",
+        document_xml,
+    )
+    if src_m:
+        # от заголовка источников до конца документа (дальше только приложения)
+        src_zone = document_xml[src_m.start():]
+        zone_numids = set(re.findall(r'<w:numId w:val="(\d+)"\s*/>', src_zone))
+        for m in re.finditer(r'<w:num w:numId="(\d+)"[^>]*>\s*<w:abstractNumId w:val="(\d+)"\s*/>', numbering_xml):
+            if m.group(1) in zone_numids:
+                exempt_abs.add(m.group(2))
+
     def fix_lvl(block: str, ilvl: str, kind: str) -> str:
         if kind == "dash":
             fmt, text = "bullet", "–"
@@ -479,6 +498,9 @@ def _fix_lists(document_xml: str, numbering_xml):
 
     def process_abstract(m: re.Match) -> str:
         abstract = m.group(0)
+        am = re.search(r'<w:abstractNum w:abstractNumId="(\d+)"', abstract)
+        if am and am.group(1) in exempt_abs:
+            return abstract  # нумерация из секции источников — не трогаем
         lvl0 = re.search(r'<w:lvl w:ilvl="0">.*?</w:lvl>', abstract, re.S)
         if not lvl0:
             return abstract
