@@ -133,6 +133,7 @@ class Expect:
         self.page_w = PAGE_W
         self.page_h = PAGE_H
         self.page_tol = PAGE_TOL
+        self.heading_bold = True
         self.source = "built-in fallback"
 
     def load(self, profile: str) -> "Expect":
@@ -157,6 +158,8 @@ class Expect:
             self.line = _int(sp[0])
             self.line_rule = sp[1] or self.line_rule
         self.jc = styles.resolve(normal_sid(styles), pick_ppr_jc) or self.jc
+        hb = styles.resolve(style_by_name(styles, "heading 1") or "Heading1", pick_rpr_bold)
+        self.heading_bold = hb is True
         for sid in (style_by_name(styles, "Body Text") or "BodyText",
                 style_by_name(styles, "First Paragraph") or "FirstParagraph1"):
             fl = _int(styles.resolve(sid, pick_ppr_first_line))
@@ -430,12 +433,15 @@ def main():
                 f"{fl} twips" if fl is not None else "none",
                 f"{exp.first_line} twips (1.25 cm)")
 
-    # -- 4. Headings resolve to bold ----------------------------------------
+    # -- 4. Headings bold state matches the profile reference ---------------
     for sid in (style_by_name(styles, "heading 1") or "Heading1",
                 style_by_name(styles, "heading 2") or "Heading2",
                 style_by_name(styles, "heading 3") or "Heading3"):
         bold = styles.resolve(sid, pick_rpr_bold) if styles.get(sid) is not None else None
-        r.check(f"heading-bold[{sid}]", bold is True, bold, "True (bold)")
+        want = exp.heading_bold
+        r.check(f"heading-bold[{sid}]", (bold is True) == want,
+                f"{'bold' if bold is True else 'not bold'}",
+                f"{'bold' if want else 'not bold'} (per reference.docx)")
 
     # -- 5. Source Code / inline code are monospace -------------------------
     for sid, label in ((style_by_name(styles, "Source Code") or "SourceCode1", "Source Code"),
@@ -488,7 +494,7 @@ def main():
     # body section carries the PAGEFAULT footer copied by pandoc from
     # reference.docx: centered PAGE field + <w:titlePg/>.
     footer_parts = [n for n in zf.namelist()
-                    if re.match(r"word/footer\d*\.xml$", n)]
+                    if re.match(r"word/footer[^/]*\.xml$", n)]
     page_field = False
     centered = False
     for name in footer_parts:

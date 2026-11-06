@@ -239,39 +239,97 @@ def transplant_reference_styles(title_path: Path, reference_doc: Path):
 
     style_re = re.compile(r"<w:style [^>]*>.*?</w:style>", re.DOTALL)
     id_re = re.compile(r'w:styleId="([^"]+)"')
+    name_re = re.compile(r'<w:name w:val="([^"]+)"')
 
-    ref_blocks = {}
-    for block in style_re.findall(ref_styles):
-        m = id_re.search(block)
-        if m:
-            # Drop numPr: reference numIds point into reference numbering.xml,
-            # which is NOT transplanted — in the merged doc the same numId
-            # would resolve to the body's list numbering (visible numbers).
-            block = re.sub(r"<w:numPr>.*?</w:numPr>", "", block, flags=re.DOTALL)
-            ref_blocks[m.group(1)] = block
+    def parse(xml: str) -> dict:
+        out = {}
+        for block in style_re.findall(xml):
+            m, n = id_re.search(block), name_re.search(block)
+            if m:
+                out[m.group(1)] = (n.group(1) if n else m.group(1), block)
+        return out
 
-    # Replace same-id styles with the reference definitions
-    replaced = set()
+    tpl = parse(tpl_styles)
+    ref = parse(ref_styles)
+    if not ref:
+        return
+
+    # Match styles by NAME, not by id: LibreOffice-authored templates and
+    # reference.docx use overlapping auto-ids for DIFFERENT styles (e.g. af2
+    # is the centered title style in pgu_lab.docx but "Колонтитулы" in
+    # reference.docx). Replacing by id silently re-styled the whole title
+    # page. Rule per reference style:
+    #   - the template already has a style with the same NAME -> the
+    #     reference definition replaces it in place under the template's id
+    #     (no duplicate names; docxcompose would keep the master's copy on a
+    #     name clash, so this is what makes the reference win), and the ref
+    #     id maps onto the template id for cross-references;
+    #   - ids collide but names differ -> the reference style is appended
+    #     under a fresh unique id;
+    #   - otherwise -> appended as is.
+    ref_by_name = {}
+    for rid, (rname, _) in ref.items():
+        ref_by_name.setdefault(rname, rid)
+    taken = set(tpl)
+    mapping = {}  # ref styleId -> final styleId
+    for rid, (rname, _) in ref.items():
+        tpl_sid = next((s for s, (n, _) in tpl.items() if n == rname), None)
+        if tpl_sid is not None:
+            mapping[rid] = tpl_sid
+        elif rid in taken:
+            nid = "R" + rid
+            while nid in taken or nid in mapping.values():
+                nid = "R" + nid
+            mapping[rid] = nid
+            taken.add(nid)
+        else:
+            mapping[rid] = rid
+            taken.add(rid)
+
+    ref_attr_re = re.compile(r'(<w:(?:basedOn|next|link)\b[^>]*w:val=")([^"]+)(")')
+
+    def finalize(rid: str, strip_default: bool) -> str:
+        # Drop numPr: reference numIds point into reference numbering.xml,
+        # which is NOT transplanted — in the merged doc the same numId
+        # would resolve to the body's list numbering (visible numbers).
+        block = re.sub(r"<w:numPr>.*?</w:numPr>", "", ref[rid][1], flags=re.DOTALL)
+        if strip_default:
+            block = block.replace(' w:default="1"', "")
+        block = id_re.sub(f'w:styleId="{mapping[rid]}"', block, count=1)
+
+        def remap(m: re.Match) -> str:
+            return m.group(1) + mapping.get(m.group(2), m.group(2)) + m.group(3)
+
+        return ref_attr_re.sub(remap, block)
 
     def swap(m: re.Match) -> str:
+        nonlocal swapped_names
+        name_m = name_re.search(m.group(0))
         sid_m = id_re.search(m.group(0))
-        if sid_m and sid_m.group(1) in ref_blocks:
-            replaced.add(sid_m.group(1))
-            return ref_blocks[sid_m.group(1)]
-        return m.group(0)
+        if not (name_m and name_m.group(1) in ref_by_name and sid_m):
+            return m.group(0)
+        if name_m.group(1) in swapped_names:
+            # Duplicate same-name template style: drop, the first copy was
+            # already replaced with the reference definition.
+            return ""
+        swapped_names.add(name_m.group(1))
+        return finalize(ref_by_name[name_m.group(1)], strip_default=False)
 
+    swapped_names = set()
     tpl_styles = style_re.sub(swap, tpl_styles)
 
-    # Append reference styles the template didn't have. docDefaults stay
+    # Append reference styles whose names the template didn't have (both the
+    # id-free case and the different-name id collision). docDefaults stay
     # untouched: reference body styles are fully explicit (Normal included),
     # while title paragraphs must be bound to their own TitleText style —
-    # NOT Normal — so the GOST Normal transplant can't reflow the title page.
-    # Strip w:default — the title doc keeps its own default styles; body
-    # styles are referenced by id (pStyle/basedOn) and don't need the flag.
+    # NOT Normal — so the GOST Normal transplant can't reflow the title
+    # page. Strip w:default — the title doc keeps its own default styles;
+    # body styles are referenced by id (pStyle/basedOn) and don't need the
+    # flag.
     missing = "".join(
-        block.replace(' w:default="1"', "")
-        for sid, block in ref_blocks.items()
-        if sid not in replaced
+        finalize(rid, strip_default=True)
+        for rid, (rname, _) in ref.items()
+        if rname not in swapped_names
     )
     tpl_styles = tpl_styles.replace("</w:styles>", missing + "</w:styles>")
 
@@ -339,11 +397,12 @@ def _postprocess_body(body_path: Path, metadata: dict):
             if "word/numbering.xml" in names
             else None
         )
-        heading_styles = _heading_style_ids(
+        body_styles_xml = (
             zf.read("word/styles.xml").decode("utf-8")
             if "word/styles.xml" in names
             else ""
         )
+        heading_styles = _heading_style_ids(body_styles_xml)
 
     document_xml = _fix_tables(document_xml)
     document_xml = _fit_table_widths(document_xml)
@@ -358,7 +417,9 @@ def _postprocess_body(body_path: Path, metadata: dict):
     if lists_style == "pgu":
         document_xml, numbering_xml = _fix_lists(document_xml, numbering_xml)
     if add_toc:
-        document_xml = _insert_toc_field(document_xml, toc_title)
+        document_xml = _insert_toc_field(document_xml, toc_title,
+                                         unnumbered_sid=_style_id_by_name(
+                                             body_styles_xml, "UnnumberedHeading1NoTOC"))
 
     # Repack
     with zipfile.ZipFile(body_path, "r") as zin:
@@ -900,19 +961,37 @@ def _center_appendix_titles(document_xml: str, heading_styles=None) -> str:
     return "".join(out)
 
 
-def _insert_toc_field(document_xml: str, toc_title: str = "СОДЕРЖАНИЕ") -> str:
+def _style_id_by_name(styles_xml: str, name: str) -> str:
+    """Resolve a styleId by style name; empty string when not found."""
+    for block in re.findall(r"<w:style [^>]*>.*?</w:style>", styles_xml, re.DOTALL):
+        m = re.search(r'<w:name w:val="([^"]+)"', block)
+        if m and m.group(1) == name:
+            sid = re.search(r'w:styleId="([^"]+)"', block)
+            if sid:
+                return sid.group(1)
+    return ""
+
+
+def _insert_toc_field(
+    document_xml: str,
+    toc_title: str = "СОДЕРЖАНИЕ",
+    unnumbered_sid: str = "UnnumberedHeading1NoTOC",
+) -> str:
     """Insert an automatic Word TOC field. Placed at the very start of the
     body, or — when the document opens with РЕФЕРАТ/АННОТАЦИЯ (ВКР) — right
     after that section, per ГОСТ 7.32 element order.
 
     `toc_title` — heading text above the field (ПГУ ИБСТ требует «ОГЛАВЛЕНИЕ»).
+    `unnumbered_sid` — styleId of the UnnumberedHeading1NoTOC style; resolved
+    from the body's styles.xml by name, since LibreOffice-authored templates
+    renumber style ids arbitrarily.
     """
     if 'TOC \\o' in document_xml:
         return document_xml  # already inserted
 
     toc_core = (
         # Heading line
-        '<w:p><w:pPr><w:pStyle w:val="UnnumberedHeading1NoTOC1"/>'
+        f'<w:p><w:pPr><w:pStyle w:val="{unnumbered_sid or "UnnumberedHeading1NoTOC"}"/>'
         '<w:jc w:val="center"/></w:pPr>'
         f'<w:r><w:t xml:space="preserve">{toc_title}</w:t></w:r></w:p>'
         # TOC field
@@ -1160,6 +1239,36 @@ def merge_documents(title_path: Path, body_path: Path, output_path: Path):
     body_doc = Document(str(body_path))
     composer.append(body_doc)
     composer.save(str(output_path))
+    _normalize_compat_mode(output_path)
+
+
+def _normalize_compat_mode(docx_path: Path):
+    """Bump compatibilityMode to 15 after the merge.
+
+    docxcompose keeps the master document's settings.xml, so a title
+    template saved by an old Word (compatibilityMode 11/12/14) drags the
+    merged document into legacy mode. Modern pandoc emits elements unknown
+    to the legacy schema (e.g. w:tblCaption on tables) and Word then refuses
+    to open the file outright («Ошибка Word при попытке открытия файла»).
+    """
+    with zipfile.ZipFile(docx_path, "r") as zf:
+        names = zf.namelist()
+        if "word/settings.xml" not in names:
+            return
+        files = {n: zf.read(n) for n in names}
+    settings = files["word/settings.xml"].decode("utf-8")
+
+    m = re.search(
+        r'<w:compatSetting w:name="compatibilityMode"[^>]*w:val="(\d+)"', settings
+    )
+    if not m or int(m.group(1)) >= 15:
+        return
+    files["word/settings.xml"] = settings.replace(
+        m.group(0), m.group(0).replace(f'w:val="{m.group(1)}"', 'w:val="15"')
+    ).encode("utf-8")
+    with zipfile.ZipFile(docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in files.items():
+            zout.writestr(name, data)
 
 
 def _find_soffice():
