@@ -69,7 +69,7 @@ def main():
     import uno  # noqa: F401  (fail fast, до запуска soffice)
     from com.sun.star.beans import PropertyValue
 
-    with tempfile.TemporaryDirectory() as profile:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile:
         proc = subprocess.Popen(
             [
                 soffice,
@@ -125,6 +125,7 @@ def main():
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=10)
     restore_canonical_style_ids(path)
     print(f"Fields updated: {path}")
     return 0

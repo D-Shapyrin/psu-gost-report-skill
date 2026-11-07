@@ -410,7 +410,12 @@ def _postprocess_body(body_path: Path, metadata: dict):
     document_xml = _fit_table_widths(document_xml)
     document_xml = _live_caption_numbers(document_xml, body_styles_xml)
     document_xml = _fix_structural_headings(document_xml, heading_styles)
-    document_xml = _center_appendix_titles(document_xml, heading_styles)
+    document_xml = _center_appendix_titles(document_xml, body_styles_xml,
+                                           heading_styles)
+    # Приложения всегда с новой страницы; остальные разделы — по флагу
+    document_xml = _sections_new_page(
+        document_xml, heading_styles, appendix_only=not sections_new_page
+    )
     if sections_new_page:
         document_xml = _sections_new_page(document_xml, heading_styles)
     if number_formulas:
@@ -700,11 +705,57 @@ def _number_formulas(document_xml: str, metadata: dict) -> str:
     return "".join(out)
 
 
+def _compact_table_paragraph(p_xml: str) -> str:
+    """Содержимое ячейки — компактное: 12 пт, одинарный межстрочный
+    интервал, без отбивок (аналог старого стиля «ГОСТ_Содержание_Таблицы»).
+    ГОСТ 7.32 разрешает уменьшенный кегль в таблицах."""
+    SIZE = "24"  # полупункты: 12 пт
+
+    if "<w:pPr>" in p_xml:
+        if re.search(r"<w:spacing[^/]*/>", p_xml):
+            p_xml = re.sub(
+                r"<w:spacing[^/]*/>",
+                '<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>',
+                p_xml,
+                count=1,
+            )
+        else:
+            # OOXML pPr child order: spacing после pStyle/keepNext
+            anchor = re.search(r"<w:pPr>(?:\s*<w:pStyle[^/]*/>)?", p_xml)
+            p_xml = (
+                p_xml[:anchor.end()]
+                + '<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>'
+                + p_xml[anchor.end():]
+            )
+    else:
+        p_xml = re.sub(
+            r"(<w:p\b[^/>]*>)",
+            r'\1<w:pPr><w:spacing w:before="0" w:after="0" w:line="240" '
+            'w:lineRule="auto"/></w:pPr>',
+            p_xml,
+            count=1,
+        )
+
+    def add_sz(rpr_m: re.Match) -> str:
+        rpr = rpr_m.group(0)
+        if "<w:sz " in rpr or "<w:sz/" in rpr:
+            return rpr
+        return rpr.replace("</w:rPr>", f'<w:sz w:val="{SIZE}"/><w:szCs w:val="{SIZE}"/></w:rPr>', 1)
+
+    p_xml = re.sub(r"<w:rPr>.*?</w:rPr>", add_sz, p_xml, flags=re.DOTALL)
+    # прогонам без rPr добавляем свой кегль
+    return re.sub(
+        r"(<w:r\b[^>]*>)(?!<w:rPr>)",
+        rf'\1<w:rPr><w:sz w:val="{SIZE}"/><w:szCs w:val="{SIZE}"/></w:rPr>',
+        p_xml,
+    )
+
+
 def _fix_tables(document_xml: str) -> str:
     """For every <w:tbl>:
     - tblLayout fixed → autofit
     - tblW: w=0, type=auto (let Word recalc)
-    - first row: paragraphs in cells get jc=center
+    - cell paragraphs: compact (12 pt, single spacing), first row centered
     - insert empty paragraph after table for spacing
     """
 
@@ -744,6 +795,17 @@ def _fix_tables(document_xml: str) -> str:
         if first_row:
             new_first = _center_row_paragraphs(first_row.group(0))
             tbl = tbl.replace(first_row.group(0), new_first, 1)
+
+        # Compact content in all cells: 12 pt, single spacing
+        def compact_row(row_m: re.Match) -> str:
+            return re.sub(
+                r"<w:p\b[^/>]*?>(?:(?!</w:p>).)*?</w:p>",
+                lambda pm: _compact_table_paragraph(pm.group(0)),
+                row_m.group(0),
+                flags=re.DOTALL,
+            )
+
+        tbl = re.sub(r"<w:tr\b.*?</w:tr>", compact_row, tbl, flags=re.DOTALL)
 
         # cantSplit: строка таблицы не режется границей страницы, а целиком
         # переезжает на следующую (иначе на разрыве остаётся огрызок строки)
@@ -1063,10 +1125,15 @@ def _number_headings(document_xml: str, numbering_xml, heading_styles=None):
     return _PARA_RE.sub(process, document_xml), numbering_xml
 
 
-def _sections_new_page(document_xml: str, heading_styles=None) -> str:
+def _sections_new_page(document_xml: str, heading_styles=None,
+                       appendix_only: bool = False) -> str:
     """Give every Heading1 a pageBreakBefore (each section starts on a new
     page, ГОСТ 7.32). Skipped for the first paragraph of the body and for
-    headings already preceded by an explicit page break (agent's \\newpage)."""
+    headings already preceded by an explicit page break (agent's \\newpage).
+
+    appendix_only=True: разрыв ставится только заголовкам «Приложение …» —
+    каждое приложение всегда начинается с новой страницы (ГОСТ 7.32,
+    п. 6.14), независимо от настройки sections_new_page."""
     paras = list(_PARA_RE.finditer(document_xml))
     out = []
     last_end = 0
@@ -1075,6 +1142,13 @@ def _sections_new_page(document_xml: str, heading_styles=None) -> str:
         p = m.group(0)
         out.append(document_xml[last_end:m.start()])
         if _para_heading_level(p, heading_styles) == 1 and prev_p is not None:
+            if appendix_only and not re.match(
+                r"приложение\s+\S+", _para_text(p).strip().lower()
+            ):
+                out.append(p)
+                last_end = m.end()
+                prev_p = m.group(0)
+                continue
             prev_is_break = (
                 'w:type="page"' in prev_p and not _para_text(prev_p).strip()
             )
@@ -1096,29 +1170,52 @@ def _sections_new_page(document_xml: str, heading_styles=None) -> str:
     return "".join(out)
 
 
-def _center_appendix_titles(document_xml: str, heading_styles=None) -> str:
-    """ГОСТ 7.32: заголовок приложения — отдельной строкой по центру. Центрирует
-    первый обычный параграф сразу после заголовка «ПРИЛОЖЕНИЕ X»."""
+_CENTER_STYLE_NAME = re.compile(r"центр|center", re.I)
+
+
+def _center_appendix_titles(document_xml: str, styles_xml: str = "",
+                            heading_styles=None) -> str:
+    """ГОСТ 7.32 (п. 6.14): у приложения по центру идут «ПРИЛОЖЕНИЕ А»,
+    ниже «(обязательное)», ниже заголовок приложения. Центрирует весь блок
+    сразу после заголовка «ПРИЛОЖЕНИЕ X»: первый непустой абзац — всегда,
+    следующие — только если их стиль «центрированный» (имя содержит
+    «центр»/«center», как у «ГОСТ_Текст_По_Центру Шапырин»). Любой другой
+    стиль (обычный текст, листинг) закрывает блок."""
+    center_sids = set()
+    for block in re.findall(r"<w:style [^>]*>.*?</w:style>", styles_xml, re.S):
+        sid = re.search(r'w:styleId="([^"]*)"', block)
+        name = re.search(r'<w:name w:val="([^"]*)"', block)
+        if sid and name and _CENTER_STYLE_NAME.search(name.group(1)):
+            center_sids.add(sid.group(1))
+
+    def center(p: str) -> str:
+        if re.search(r"<w:jc[^/]*/>", p):
+            return re.sub(r"<w:jc[^/]*/>", '<w:jc w:val="center"/>', p, count=1)
+        if "<w:pPr>" in p:
+            return p.replace("<w:pPr>", '<w:pPr><w:jc w:val="center"/>', 1)
+        return re.sub(r"(<w:p\b[^/>]*?>)",
+                      r'\1<w:pPr><w:jc w:val="center"/></w:pPr>', p, count=1)
+
     paras = list(_PARA_RE.finditer(document_xml))
     out, last_end = [], 0
-    prev_was_appendix = False
+    pending = False   # идёт блок заголовка приложения
+    centered = False  # первую строку титула центрируем всегда
     for m in paras:
         p = m.group(0)
         out.append(document_xml[last_end:m.start()])
-        if prev_was_appendix and _para_heading_level(p, heading_styles) is None and _para_text(p).strip():
-            if re.search(r"<w:jc[^/]*/>", p):
-                p = re.sub(r"<w:jc[^/]*/>", '<w:jc w:val="center"/>', p, count=1)
-            elif "<w:pPr>" in p:
-                p = p.replace("<w:pPr>", '<w:pPr><w:jc w:val="center"/>', 1)
+        level = _para_heading_level(p, heading_styles)
+        plain = _para_text(p).strip().lower()
+        if level is not None:
+            pending = re.fullmatch(r"приложение\s+\S+", plain) is not None
+            centered = False
+        elif pending and plain:
+            sid_m = re.search(r'<w:pStyle w:val="([^"]*)"', p)
+            sid = sid_m.group(1) if sid_m else ""
+            if not centered or sid in center_sids:
+                p = center(p)
+                centered = True
             else:
-                p = re.sub(r"(<w:p\b[^/>]*?>)", r'\1<w:pPr><w:jc w:val="center"/></w:pPr>', p, count=1)
-            prev_was_appendix = False
-        else:
-            plain = _para_text(p).strip().lower()
-            prev_was_appendix = (
-                _para_heading_level(p, heading_styles) is not None
-                and re.fullmatch(r"приложение\s+[а-яё]", plain) is not None
-            )
+                pending = False  # обычный текст/листинг — блок титула закрыт
         out.append(p)
         last_end = m.end()
     out.append(document_xml[last_end:])
@@ -1252,6 +1349,46 @@ def normalize_final_sections(output_path: Path, reference_doc: Path):
     with zipfile.ZipFile(output_path, "r") as zf:
         names = zf.namelist()
         files = {n: zf.read(n) for n in names}
+
+    final_styles_xml = files.get("word/styles.xml", b"").decode("utf-8")
+    final_ids = set(re.findall(r'w:styleId="([^"]*)"', final_styles_xml))
+    final_name_to_id = {}
+    for block in re.findall(r"<w:style [^>]*>.*?</w:style>", final_styles_xml, re.S):
+        sid = re.search(r'w:styleId="([^"]*)"', block)
+        name = re.search(r'<w:name w:val="([^"]*)"', block)
+        if sid and name:
+            final_name_to_id.setdefault(name.group(1), sid.group(1))
+
+    def relink_payload(payload: str) -> str:
+        """Payload ссылается на стиль колонтитула по id (af5 из reference.docx
+        или «Footer» из шаблона выше). В итоговом styles.xml id мог быть
+        переименован LO round-trip'ом («Footer») — висячая ссылка сбивает LO
+        с толку (мусорный маркер «X» в колонтитуле). Перелинковываем по
+        имени стиля."""
+        m = re.search(r'<w:pStyle w:val="([^"]*)"', payload)
+        if not m or m.group(1) in final_ids:
+            return payload
+        wanted = m.group(1)
+        with zipfile.ZipFile(reference_doc) as zref:
+            ref_styles = zref.read("word/styles.xml").decode("utf-8")
+        # имя стиля: сначала по id из reference.docx, иначе сам id как имя
+        name = wanted
+        for block in re.findall(r"<w:style [^>]*>.*?</w:style>", ref_styles, re.S):
+            if f'w:styleId="{wanted}"' in block:
+                nm = re.search(r'<w:name w:val="([^"]*)"', block)
+                if nm:
+                    name = nm.group(1)
+                break
+        new_id = final_name_to_id.get(name) or final_name_to_id.get(name.lower())
+        if new_id:
+            return payload.replace(
+                f'<w:pStyle w:val="{wanted}"/>',
+                f'<w:pStyle w:val="{new_id}"/>',
+            )
+        return payload
+
+    page_footer = relink_payload(page_footer)
+    empty_footer = relink_payload(empty_footer)
 
     document_xml = files["word/document.xml"].decode("utf-8")
     rels_xml = files["word/_rels/document.xml.rels"].decode("utf-8")
@@ -1505,12 +1642,19 @@ def main():
         soffice = _find_soffice()
         if soffice:
             updater = SKILL_DIR / "scripts" / "update_fields.py"
+            # update_fields.py импортирует uno — он есть в питоне LibreOffice,
+            # в системном интерпретаторе его обычно нет
+            lo_python = Path(soffice).parent / "python.exe"
+            updater_python = lo_python if lo_python.exists() else sys.executable
             try:
                 subprocess.run(
-                    [sys.executable, str(updater), str(output_path), soffice],
+                    [str(updater_python), str(updater), str(output_path), soffice],
                     check=True,
                     timeout=180,
                 )
+                # LO round-trip подгоняет поля страницы под свою сетку
+                # (1134 -> 1191 twips) — возвращаем эталонную геометрию
+                normalize_final_sections(output_path, reference_doc)
                 print("TOC computed (LibreOffice)")
             except Exception as exc:
                 print(f"Warning: TOC not auto-updated ({exc}); откройте в Word и нажмите F9")
