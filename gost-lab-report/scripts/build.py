@@ -1173,20 +1173,29 @@ def _sections_new_page(document_xml: str, heading_styles=None,
 _CENTER_STYLE_NAME = re.compile(r"центр|center", re.I)
 
 
+_STOP_STYLE_NAME = re.compile(
+    r"caption|source code|compact|list paragraph|block (text|quote)", re.I
+)
+
+
 def _center_appendix_titles(document_xml: str, styles_xml: str = "",
                             heading_styles=None) -> str:
     """ГОСТ 7.32 (п. 6.14): у приложения по центру идут «ПРИЛОЖЕНИЕ А»,
-    ниже «(обязательное)», ниже заголовок приложения. Центрирует весь блок
-    сразу после заголовка «ПРИЛОЖЕНИЕ X»: первый непустой абзац — всегда,
-    следующие — только если их стиль «центрированный» (имя содержит
-    «центр»/«center», как у «ГОСТ_Текст_По_Центру Шапырин»). Любой другой
-    стиль (обычный текст, листинг) закрывает блок."""
-    center_sids = set()
+    ниже «(обязательное)», ниже заголовок приложения. Центрирует блок сразу
+    после заголовка «ПРИЛОЖЕНИЕ X»: первую строку — всегда, дальше — строки
+    титула, т.е. пока абзац не закончился предложением и его стиль не
+    заведомо нетитульный (листинг, подпись, ячейка таблицы). Стили с
+    «центр»/«center» в имени центрируются безусловно."""
+    center_sids, stop_sids = set(), set()
     for block in re.findall(r"<w:style [^>]*>.*?</w:style>", styles_xml, re.S):
         sid = re.search(r'w:styleId="([^"]*)"', block)
         name = re.search(r'<w:name w:val="([^"]*)"', block)
-        if sid and name and _CENTER_STYLE_NAME.search(name.group(1)):
+        if not sid or not name:
+            continue
+        if _CENTER_STYLE_NAME.search(name.group(1)):
             center_sids.add(sid.group(1))
+        if _STOP_STYLE_NAME.search(name.group(1)):
+            stop_sids.add(sid.group(1))
 
     def center(p: str) -> str:
         if re.search(r"<w:jc[^/]*/>", p):
@@ -1199,21 +1208,28 @@ def _center_appendix_titles(document_xml: str, styles_xml: str = "",
     paras = list(_PARA_RE.finditer(document_xml))
     out, last_end = [], 0
     pending = False   # идёт блок заголовка приложения
-    centered = False  # первую строку титула центрируем всегда
+    centered = 0      # сколько строк титула уже центрировано
     for m in paras:
         p = m.group(0)
         out.append(document_xml[last_end:m.start()])
         level = _para_heading_level(p, heading_styles)
-        plain = _para_text(p).strip().lower()
+        plain = _para_text(p).strip()
         if level is not None:
-            pending = re.fullmatch(r"приложение\s+\S+", plain) is not None
-            centered = False
+            pending = re.fullmatch(r"приложение\s+\S+", plain.lower()) is not None
+            centered = 0
         elif pending and plain:
             sid_m = re.search(r'<w:pStyle w:val="([^"]*)"', p)
             sid = sid_m.group(1) if sid_m else ""
-            if not centered or sid in center_sids:
+            # строки титула («(обязательное)», название) — без точки в конце;
+            # обычный текст приложения заканчивается предложением — на нём
+            # блок закрываем. Первую строку центрируем всегда (ГОСТ 7.32
+            # допускает набор титула обычным стилем).
+            ends_sentence = bool(re.search(r"[.!?:]$", plain))
+            if centered == 0 or sid in center_sids or (
+                not ends_sentence and sid not in stop_sids
+            ):
                 p = center(p)
-                centered = True
+                centered += 1
             else:
                 pending = False  # обычный текст/листинг — блок титула закрыт
         out.append(p)
