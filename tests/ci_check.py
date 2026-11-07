@@ -86,7 +86,13 @@ def heading_texts(docx_path):
             m = re.fullmatch(r"Heading([1-9])", sid.group(1))
             level = int(m.group(1)) if m else None
         if level is not None:
-            texts.append("".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", p)))
+            text = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", p))
+            # номер может быть статическим текстом или полем многоуровневого
+            # списка (numPr) — засчитываем оба способа
+            numbered = bool(re.search(r"<w:numPr>", p)) or bool(
+                re.match(r"^\s*\d+(\.\d+)*\s", text)
+            )
+            texts.append((text, numbered))
     return texts
 
 
@@ -124,11 +130,11 @@ def main():
         # «ВВЕДЕНИЕ» не нумеруются — их отсутствие номера не претензия).
         if str(meta.get("number_headings", "")).lower() in ("true", "yes", "1"):
             heads = heading_texts(out)
-            numbered = [h for h in heads if re.match(r"^\d+(\.\d+)*\s", h)]
+            numbered = [h for h, is_num in heads if is_num]
             if heads and not numbered:
                 failures.append(
                     f"numbering {name}: ни один заголовок не пронумерован "
-                    f"({heads[:3]}...) — проверь number_headings/_heading_style_ids"
+                    f"({[h for h, _ in heads][:3]}...) — проверь number_headings/_heading_style_ids"
                 )
             print(f"numbering {name}: {len(numbered)}/{len(heads)} headings numbered")
 

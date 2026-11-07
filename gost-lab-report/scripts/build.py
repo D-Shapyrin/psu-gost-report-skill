@@ -411,14 +411,18 @@ def _postprocess_body(body_path: Path, metadata: dict):
     document_xml = _live_caption_numbers(document_xml, body_styles_xml)
     document_xml = _fix_structural_headings(document_xml, heading_styles)
     document_xml = _center_appendix_titles(document_xml, heading_styles)
-    if do_number_headings:
-        document_xml = _number_headings(document_xml, heading_styles)
     if sections_new_page:
         document_xml = _sections_new_page(document_xml, heading_styles)
     if number_formulas:
         document_xml = _number_formulas(document_xml, metadata)
     if lists_style == "pgu":
         document_xml, numbering_xml = _fix_lists(document_xml, numbering_xml)
+    # После _fix_lists: перекраска перечислений трогает все abstractNum,
+    # включая многоуровневую нумерацию заголовков
+    if do_number_headings:
+        document_xml, numbering_xml = _number_headings(
+            document_xml, numbering_xml, heading_styles
+        )
     if add_toc:
         document_xml = _insert_toc_field(document_xml, toc_title,
                                          unnumbered_sid=_style_id_by_name(
@@ -977,36 +981,86 @@ def _is_unnumbered_heading(text: str) -> bool:
     return plain in GOST_STRUCTURAL_HEADINGS or plain.startswith("приложение ")
 
 
-def _number_headings(document_xml: str, heading_styles=None) -> str:
-    """Prefix Heading1-3 text with ГОСТ 7.32 numbers («1 Название», «1.1 …»).
+def _number_headings(document_xml: str, numbering_xml, heading_styles=None):
+    """Нумеровать Heading1-3 многоуровневым списком (ГОСТ 7.32: «1 Название»,
+    «1.1 …» — без точки после номера).
 
-    Structural headings (введение, заключение, …) and приложения are skipped.
-    Numbers are inserted as plain text so the .docx stays fully static.
+    В отличие от статической простановки номер живёт в поле нумерации: numPr
+    на абзацах заголовков + абстрактная нумерация «%1 / %1.%2 / %1.%2.%3»
+    (suff="space") в numbering.xml. Word/LO пересчитывают номера сами при
+    вставке/удалении разделов. Структурные элементы (введение, заключение,
+    …) и приложения не нумеруются, авторская нумерация в тексте не
+    дублируется. Вызывать ПОСЛЕ _fix_lists — иначе перекраска перечислений
+    превратит уровни в «а)».
+
+    Возвращает (document_xml, numbering_xml); numbering_xml создаётся, если
+    его в теле не было.
     """
-    counters = [0] * MAX_HEADING_LEVEL
+    levels = []
+    for ilvl in range(MAX_HEADING_LEVEL):
+        lvl_text = ".".join(f"%{i + 1}" for i in range(ilvl + 1))
+        levels.append(
+            f'<w:lvl w:ilvl="{ilvl}"><w:start w:val="1"/>'
+            f'<w:numFmt w:val="decimal"/><w:suff w:val="space"/>'
+            f'<w:lvlText w:val="{lvl_text}"/><w:lvlJc w:val="left"/></w:lvl>'
+        )
+
+    if numbering_xml is None:
+        numbering_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
+            'wordprocessingml/2006/main"></w:numbering>'
+        )
+
+    abstract_id = max(
+        [int(v) for v in re.findall(r'<w:abstractNum w:abstractNumId="(\d+)"', numbering_xml)]
+        + [-1]
+    ) + 1
+    num_id = max(
+        [int(v) for v in re.findall(r'<w:num w:numId="(\d+)"', numbering_xml)] + [0]
+    ) + 1
+
+    abstract = (
+        f'<w:abstractNum w:abstractNumId="{abstract_id}">'
+        '<w:multiLevelType w:val="multilevel"/>'
+        + "".join(levels)
+        + "</w:abstractNum>"
+    )
+    new_num = f'<w:num w:numId="{num_id}"><w:abstractNumId w:val="{abstract_id}"/></w:num>'
+    # abstractNum'ы должны стоять раньше num'ов
+    if "<w:num " in numbering_xml:
+        numbering_xml = re.sub(r"(<w:num )", abstract + r"\1", numbering_xml, count=1)
+    else:
+        numbering_xml = numbering_xml.replace(
+            "</w:numbering>", abstract + new_num + "</w:numbering>"
+        )
+    if new_num not in numbering_xml:
+        numbering_xml = numbering_xml.replace(
+            "</w:numbering>", new_num + "</w:numbering>"
+        )
+
+    num_pr = f'<w:numPr><w:ilvl w:val="{{ilvl}}"/><w:numId w:val="{num_id}"/></w:numPr>'
 
     def process(m: re.Match) -> str:
         p = m.group(0)
         level = _para_heading_level(p, heading_styles)
-        if level is None:
+        if level is None or level > MAX_HEADING_LEVEL:
             return p
         text = _para_text(p)
         if not text.strip() or _is_unnumbered_heading(text):
             return p
         if re.match(r"^\s*\d+(\.\d+)*\s", text):
             return p  # автор уже пронумеровал — не дублируем
-        counters[level - 1] += 1
-        for i in range(level, MAX_HEADING_LEVEL):
-            counters[i] = 0
-        number = ".".join(str(c) for c in counters[:level])
-        return re.sub(
-            r"(<w:t[^>]*>)",
-            lambda t: t.group(1) + number + " ",
-            p,
-            count=1,
-        )
+        if "<w:numPr>" in p:
+            return p  # уже в списке
+        numpr = num_pr.format(ilvl=level - 1)
+        if re.search(r"<w:pStyle[^>]*/>", p):
+            return re.sub(r"(<w:pStyle[^>]*/>)", r"\1" + numpr, p, count=1)
+        if "<w:pPr>" in p:
+            return p.replace("<w:pPr>", "<w:pPr>" + numpr, 1)
+        return re.sub(r"(<w:p\b[^>]*>)", r"\1<w:pPr>" + numpr + "</w:pPr>", p, count=1)
 
-    return _PARA_RE.sub(process, document_xml)
+    return _PARA_RE.sub(process, document_xml), numbering_xml
 
 
 def _sections_new_page(document_xml: str, heading_styles=None) -> str:
