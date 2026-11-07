@@ -408,6 +408,7 @@ def _postprocess_body(body_path: Path, metadata: dict):
 
     document_xml = _fix_tables(document_xml)
     document_xml = _fit_table_widths(document_xml)
+    document_xml = _live_caption_numbers(document_xml, body_styles_xml)
     document_xml = _fix_structural_headings(document_xml, heading_styles)
     document_xml = _center_appendix_titles(document_xml, heading_styles)
     if do_number_headings:
@@ -554,6 +555,84 @@ def _text_width_twips(document_xml: str, default: int = 9638) -> int:
     return width if width > 3000 else default
 
 
+def _seq_field(name: str, cached: str) -> str:
+    """Поле автонумерации SEQ с кешированным значением: документ выглядит
+    правильно без пересчёта, Word/LO пересчитывают по F9 / «Обновить всё»."""
+    return (
+        f'<w:fldSimple w:instr=" SEQ {name} \\* ARABIC ">'
+        f'<w:r><w:t>{cached}</w:t></w:r></w:fldSimple>'
+    )
+
+
+def _live_caption_numbers(document_xml: str, styles_xml: str) -> str:
+    """Заменить статические номера в подписях рисунков/таблиц на поля SEQ.
+
+    «Рисунок N — …» (стиль Captioned Figure / Image Caption) -> SEQ Figure,
+    «Таблица N — …» (Table Caption) -> SEQ Table. Приложенческие подписи
+    («Таблица А.1») не трогаем — отдельная нумерация на букву приложения
+    полями SEQ не выражается без закладок. Ссылки в тексте остаются статикой:
+    их корректность — ответственность автора (см. SKILL.md).
+    """
+    targets = []
+    # (styleIds, латинское имя sequence для поля, русское слово в тексте подписи)
+    for style_names, seq_name, text_word in (
+        (("Captioned Figure", "Image Caption"), "Figure", "Рисунок"),
+        (("Table Caption",), "Table", "Таблица"),
+    ):
+        for style_name in style_names:
+            sid = _style_id_by_name(styles_xml, style_name)
+            if sid:
+                targets.append((sid, seq_name, text_word))
+    if not targets:
+        return document_xml
+
+    # Номер сидит внутри текста w:t одного run'а — аккуратно делим run на
+    # «до номера», поле и «после», сохраняя rPr. Вставлять fldSimple внутрь
+    # w:t нельзя — это рвёт XML.
+    _run_re = re.compile(r"<w:r(?: [^>]*)?>(?:(?!</w:r>).)*?</w:r>", re.S)
+    _t_re = re.compile(r"(<w:t[^>]*>)([^<]*)(</w:t>)")
+
+    def process_para(m: re.Match) -> str:
+        p = m.group(0)
+        sid_m = re.search(r'<w:pStyle w:val="([^"]+)"', p)
+        if not sid_m or "fldSimple" in p:
+            return p
+        target = next((t for t in targets if t[0] == sid_m.group(1)), None)
+        if not target:
+            return p
+        _, seq_name, text_word = target
+        # поле заменяет только номер; слово-префикс («Рисунок»/«Таблица») остаётся текстом
+        pat = re.compile(rf"{text_word}\s+(\d+)")
+
+        def repl_run(rm: re.Match) -> str:
+            body = rm.group(0)
+            tm = _t_re.search(body)
+            if not tm:
+                return body
+            text = tm.group(2)
+            mm = pat.search(text)
+            if not mm:
+                return body
+            rpr = re.search(r"<w:rPr>.*?</w:rPr>", body, re.S)
+            rpr_xml = rpr.group(0) if rpr else ""
+            pre, num, post = text[: mm.start(1)], mm.group(1), text[mm.end(1):]
+            parts = []
+            if pre:
+                parts.append(
+                    f'<w:r>{rpr_xml}<w:t xml:space="preserve">{pre}</w:t></w:r>'
+                )
+            parts.append(_seq_field(seq_name, num))
+            if post:
+                parts.append(
+                    f'<w:r>{rpr_xml}<w:t xml:space="preserve">{post}</w:t></w:r>'
+                )
+            return "".join(parts)
+
+        return _run_re.sub(repl_run, p)
+
+    return _PARA_RE.sub(process_para, document_xml)
+
+
 def _number_formulas(document_xml: str, metadata: dict) -> str:
     """Пронумеровать выключные формулы: «(1)» справа от формулы.
 
@@ -584,17 +663,22 @@ def _number_formulas(document_xml: str, metadata: dict) -> str:
 
         if is_pure_formula(p):
             if state["appendix"]:
+                # Приложенческие «(А.1)» полями SEQ не выражаются без закладок
                 state["appendix_n"] += 1
                 label = f"{state['appendix'].upper()}.{state['appendix_n']}"
+                number_run = (
+                    '<w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>'
+                    '<w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>'
+                    f'<w:tab/><w:t xml:space="preserve">({label})</w:t></w:r>'
+                )
             else:
                 counter["n"] += 1
-                label = str(counter["n"])
-
-            number_run = (
-                '<w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>'
-                '<w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>'
-                f'<w:tab/><w:t xml:space="preserve">({label})</w:t></w:r>'
-            )
+                number_run = (
+                    '<w:r><w:tab/></w:r>'
+                    '<w:r><w:t>(</w:t></w:r>'
+                    + _seq_field("Formula", str(counter["n"]))
+                    + '<w:r><w:t>)</w:t></w:r>'
+                )
             tabs = ('<w:tabs><w:tab w:val="center" w:pos="%d"/>'
                     '<w:tab w:val="right" w:pos="%d"/></w:tabs>'
                     % (right_tab // 2, right_tab))
