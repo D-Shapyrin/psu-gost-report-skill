@@ -822,11 +822,15 @@ def _fix_structural_headings(document_xml: str, heading_styles=None) -> str:
         def up(t):
             return f'<w:t xml:space="preserve">{t.group(1).upper()}</w:t>'
         p = re.sub(r'<w:t[^>]*>([^<]*)</w:t>', up, p)
-        # Force centered alignment in pPr
+        # Force centered alignment in pPr; clear the first-line indent that
+        # heading styles carry (ГОСТ 6.2.3) — a centered structural heading
+        # with a red-line indent would be pushed off centre.
+        if re.search(r'<w:ind[^/]*/>', p):
+            p = re.sub(r'<w:ind[^/]*/>', '<w:ind w:firstLine="0"/>', p, count=1)
         if re.search(r'<w:jc[^/]*/>', p):
             p = re.sub(r'<w:jc[^/]*/>', '<w:jc w:val="center"/>', p)
         elif '<w:pPr>' in p:
-            p = p.replace('<w:pPr>', '<w:pPr><w:jc w:val="center"/>', 1)
+            p = p.replace('<w:pPr>', '<w:pPr><w:ind w:firstLine="0"/><w:jc w:val="center"/>', 1)
         return p
 
     return re.sub(r'<w:p\b[^/]*?>(?:(?!</w:p>).)*?</w:p>', process_para, document_xml, flags=re.DOTALL)
@@ -1014,7 +1018,7 @@ def _insert_toc_field(
     toc_core = (
         # Heading line
         f'<w:p><w:pPr><w:pStyle w:val="{unnumbered_sid or "UnnumberedHeading1NoTOC"}"/>'
-        '<w:jc w:val="center"/></w:pPr>'
+        '<w:ind w:firstLine="0"/><w:jc w:val="center"/></w:pPr>'
         f'<w:r><w:t xml:space="preserve">{toc_title}</w:t></w:r></w:p>'
         # TOC field
         '<w:p><w:pPr><w:pStyle w:val="BodyText"/></w:pPr>'
