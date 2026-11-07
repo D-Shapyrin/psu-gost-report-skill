@@ -200,7 +200,11 @@ pandoc intro.md methods.md results.md -o body.docx --reference-doc=reference.doc
 python ~/.claude/skills/gost-lab-report/scripts/build.py report.md
 ```
 
-Результат: `report.docx` в той же директории.
+Результат: `report.docx` в той же директории. С флагом `--odt` дополнительно
+конвертирует его в `report.odt` установленным LibreOffice (одним из пост-шагов;
+round-trip переименовывает styleId — для готового odt это не важно, verify.py к
+odt неприменим). СОДЕРЖАНИЕ в обоих форматах остаётся полем: в Word — Ctrl+A →
+F9, в LibreOffice — Сервис → Обновить → Обновить всё.
 
 ## Подключение титульника нового вуза
 

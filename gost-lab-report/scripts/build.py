@@ -1372,11 +1372,44 @@ def main():
                 print("TOC computed (LibreOffice)")
             except Exception as exc:
                 print(f"Warning: TOC not auto-updated ({exc}); откройте в Word и нажмите F9")
+            else:
+                print(
+                    "Warning: LibreOffice не найден — СОДЕРЖАНИЕ обновится в Word "
+                    "(Ctrl+A, F9), а {{PAGES}} в реферате останется плейсхолдером"
+                )
+
+    if "--odt" in sys.argv[2:]:
+        _export_odt(output_path)
+
+
+def _export_odt(docx_path: Path):
+    """Конвертировать собранный .docx в .odt установленным LibreOffice.
+
+    Все правки ГОСТ-постобработки живут в OOXML, поэтому odt строится как
+    производный артефакт: сначала полный docx, затем round-trip через
+    LibreOffice. Round-trip переименовывает styleId (BodyText -> TextBody и
+    т.п.) — для готового odt это не важно, но verify.py к нему неприменим;
+    СОДЕРЖАНИЕ в odt остаётся полем и обновляется в LO: Сервис -> Обновить ->
+    Обновить всё (или F9).
+    """
+    soffice = _find_soffice()
+    if not soffice:
+        print("Warning: LibreOffice не найден — .odt не собран")
+        return
+    try:
+        subprocess.run(
+            [soffice, "--headless", "--convert-to", "odt",
+             "--outdir", str(docx_path.parent), str(docx_path)],
+            check=True, timeout=180,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        odt = docx_path.with_suffix(".odt")
+        if odt.exists():
+            print(f"ODT export: {odt}")
         else:
-            print(
-                "Warning: LibreOffice не найден — СОДЕРЖАНИЕ обновится в Word "
-                "(Ctrl+A, F9), а {{PAGES}} в реферате останется плейсхолдером"
-            )
+            print("Warning: LibreOffice не создал .odt")
+    except Exception as exc:
+        print(f"Warning: не удалось конвертировать в .odt ({exc})")
 
 
 if __name__ == "__main__":
