@@ -1,6 +1,6 @@
 # gost-report-skill
 
-[![CI](https://github.com/Bbar0n234/gost-report-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/Bbar0n234/gost-report-skill/actions/workflows/ci.yml)
+[![CI](https://github.com/D-Shapyrin/psu-gost-report-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/Bbar0n234/gost-report-skill/actions/workflows/ci.yml)
 
 # Оригинальный репозиторий https://github.com/Bbar0n234/gost-report-skill
 
