@@ -35,7 +35,7 @@
 Скилл следует открытому стандарту [Agent Skills](https://agentskills.io) и работает в любом совместимом агенте:
 
 ```bash
-git clone https://github.com/Bbar0n234/gost-report-skill.git
+git clone https://github.com/D-Shapyrin/psu-gost-report-skill.git
 ```
 
 | Агент | Куда положить папку `gost-lab-report/` |
