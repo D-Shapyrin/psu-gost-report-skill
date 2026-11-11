@@ -212,3 +212,4 @@ tests/.*_preprocessed.md
 tests/_scratch/
 tests/__pycache__/
 tests/_render*/
+report that contains problems/*

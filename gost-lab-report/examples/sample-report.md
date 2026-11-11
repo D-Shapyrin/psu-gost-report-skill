@@ -11,6 +11,7 @@ discipline: "Компьютерные сети"
 group: "3234к"
 student_name: "С.А. Феоктистов"
 department: "Кафедра №33"
+landscape_tables: "true"
 ---
 
 # 1 Цель работы
