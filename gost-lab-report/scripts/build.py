@@ -407,7 +407,9 @@ def _postprocess_body(body_path: Path, metadata: dict):
         heading_styles = _heading_style_ids(body_styles_xml)
 
     document_xml = _fix_tables(document_xml)
-    document_xml = _fit_table_widths(document_xml)
+    document_xml = _fit_table_widths(
+        document_xml, landscape=flag("landscape_tables")
+    )
     document_xml = _live_caption_numbers(document_xml, body_styles_xml)
     document_xml = _fix_structural_headings(document_xml, heading_styles)
     document_xml = _center_appendix_titles(document_xml, body_styles_xml,
@@ -834,7 +836,7 @@ def _fix_tables(document_xml: str) -> str:
     return document_xml
 
 
-def _fit_table_widths(document_xml: str) -> str:
+def _fit_table_widths(document_xml: str, landscape: bool = False) -> str:
     """Пересчёт ширин колонок по фактическому содержимому ячеек.
 
     pandoc назначает gridCol пропорционально ширине колонок в исходном
@@ -846,66 +848,47 @@ def _fit_table_widths(document_xml: str) -> str:
     Ширины — стартовая раскладка для рендереров, честных к сохранённым
     значениям (LibreOffice/печать); tblLayout остаётся autofit, чтобы Word
     мог пересчитать по своим метрикам.
+
+    landscape=True: таблица, чьи минимальные ширины колонок не помещаются
+    в книжную страницу, получает собственную альбомную секцию (ГОСТ 7.32
+    допускает альбомные страницы для больших таблиц); секция содержит
+    подпись и саму таблицу. Без флага такие таблицы просто ужимаются.
     """
     CHAR_W = 150   # средняя ширина символа TNR 14pt в twips (с запасом под жирные заголовки)
     PAD = 250      # внутренние поля ячейки (2×108) + рамки
     AVAIL = 9638   # рабочая область A4 при полях слева/справа 20 мм
+    AVAIL_LANDSCAPE = 14570  # A4 альбомная: 16838 - 1701 - 567
     MIN_COL = 700
 
     def cell_text(tc_xml: str) -> str:
         return " ".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", tc_xml))
 
-    def process_table(match: re.Match) -> str:
-        tbl = match.group(0)
-        # объединённые ячейки и картинки в ячейках — раскладку не трогаем
-        if "gridSpan" in tbl or "<w:drawing" in tbl:
-            return tbl
-        grid = re.search(r"<w:tblGrid>.*?</w:tblGrid>", tbl, re.DOTALL)
-        if not grid:
-            return tbl
-        ncols = len(re.findall(r"<w:gridCol", grid.group(0)))
-        rows = re.findall(r"<w:tr\b.*?</w:tr>", tbl, re.DOTALL)
-        if not ncols or not rows:
-            return tbl
-        cols = [[] for _ in range(ncols)]
-        for row in rows:
-            cells = re.findall(r"<w:tc>.*?</w:tc>", row, re.DOTALL)
-            if len(cells) != ncols:
-                return tbl
-            for j, c in enumerate(cells):
-                cols[j].append(cell_text(c))
-
-        min_w, max_w, weight = [], [], []
-        for texts in cols:
-            words = [w for t in texts for w in t.split()] or [""]
-            longest_word = max(len(w) for w in words)
-            longest_cell = max(len(t) for t in texts)
-            min_w.append(max(MIN_COL, longest_word * CHAR_W + PAD))
-            max_w.append(max(MIN_COL, longest_cell * CHAR_W + PAD))
-            weight.append(sum(len(t) for t in texts) + 1)
-
-        if sum(min_w) >= AVAIL:
+    def distribute(widths_ncols_need):
+        ncols, min_w, max_w, weight, avail = widths_ncols_need
+        if sum(min_w) >= avail:
             # даже длиннейшие слова не помещаются — ужимаем пропорционально
-            scale = AVAIL / sum(min_w)
-            widths = [int(w * scale) for w in min_w]
-        else:
-            widths = list(min_w)
-            extra = AVAIL - sum(min_w)
-            for _ in range(3):  # излишки сверх «одной строки» перераздаются
-                growable = [j for j in range(ncols) if widths[j] < max_w[j]]
-                total_weight = sum(weight[j] for j in growable)
-                if not growable or not total_weight or extra <= 0:
-                    break
-                leftover = 0
-                for j in growable:
-                    add = int(extra * weight[j] / total_weight)
-                    if widths[j] + add > max_w[j]:
-                        leftover += widths[j] + add - max_w[j]
-                        widths[j] = max_w[j]
-                    else:
-                        widths[j] += add
-                extra = leftover
+            scale = avail / sum(min_w)
+            return [int(w * scale) for w in min_w]
+        widths = list(min_w)
+        extra = avail - sum(min_w)
+        for _ in range(3):  # излишки сверх «одной строки» перераздаются
+            growable = [j for j in range(ncols) if widths[j] < max_w[j]]
+            total_weight = sum(weight[j] for j in growable)
+            if not growable or not total_weight or extra <= 0:
+                break
+            leftover = 0
+            for j in growable:
+                add = int(extra * weight[j] / total_weight)
+                if widths[j] + add > max_w[j]:
+                    leftover += widths[j] + add - max_w[j]
+                    widths[j] = max_w[j]
+                else:
+                    widths[j] += add
+            extra = leftover
+        return widths
 
+    def apply_widths(tbl, grid, widths):
+        ncols = len(widths)
         total = sum(widths)
         new_grid = ("<w:tblGrid>"
                     + "".join(f'<w:gridCol w:w="{w}"/>' for w in widths)
@@ -927,11 +910,108 @@ def _fit_table_widths(document_xml: str) -> str:
             return re.sub(r"<w:tc>.*?</w:tc>", fix_cell, m.group(0),
                           flags=re.DOTALL)
 
-        tbl = re.sub(r"<w:tr\b.*?</w:tr>", fix_row, tbl, flags=re.DOTALL)
-        return tbl
+        return re.sub(r"<w:tr\b.*?</w:tr>", fix_row, tbl, flags=re.DOTALL)
 
-    return re.sub(r"<w:tbl>.*?</w:tbl>", process_table, document_xml,
-                  flags=re.DOTALL)
+    def analyze(tbl):
+        """(grid, размеры) для таблицы или (None, None), если раскладку
+        трогать нельзя (объединённые ячейки, картинки, рваная разметка)."""
+        if "gridSpan" in tbl or "<w:drawing" in tbl:
+            return None, None
+        grid = re.search(r"<w:tblGrid>.*?</w:tblGrid>", tbl, re.DOTALL)
+        if not grid:
+            return None, None
+        ncols = len(re.findall(r"<w:gridCol", grid.group(0)))
+        rows = re.findall(r"<w:tr\b.*?</w:tr>", tbl, re.DOTALL)
+        if not ncols or not rows:
+            return None, None
+        cols = [[] for _ in range(ncols)]
+        for row in rows:
+            cells = re.findall(r"<w:tc>.*?</w:tc>", row, re.DOTALL)
+            if len(cells) != ncols:
+                return None, None
+            for j, c in enumerate(cells):
+                cols[j].append(cell_text(c))
+
+        min_w, max_w, weight = [], [], []
+        for texts in cols:
+            words = [w for t in texts for w in t.split()] or [""]
+            longest_word = max(len(w) for w in words)
+            longest_cell = max(len(t) for t in texts)
+            min_w.append(max(MIN_COL, longest_word * CHAR_W + PAD))
+            max_w.append(max(MIN_COL, longest_cell * CHAR_W + PAD))
+            weight.append(sum(len(t) for t in texts) + 1)
+        return grid, (ncols, min_w, max_w, weight)
+
+    if not landscape:
+        def process_table(match: re.Match) -> str:
+            tbl = match.group(0)
+            grid, dims = analyze(tbl)
+            if grid is None:
+                return tbl
+            widths = distribute((*dims, AVAIL))
+            return apply_widths(tbl, grid, widths)
+
+        return re.sub(r"<w:tbl>.*?</w:tbl>", process_table, document_xml,
+                      flags=re.DOTALL)
+
+    # -- эксперимент: альбомные секции для широких таблиц -------------------
+    # содержимое sectPr БЕЗ собственных тегов (оборачиваем сами)
+    sect_template_m = re.search(r"<w:sectPr[^>]*>(.*?)</w:sectPr>", document_xml, re.DOTALL)
+    sect_template = sect_template_m.group(1) if sect_template_m else (
+        '<w:pgSz w:w="11906" w:h="16838"/>'
+        '<w:pgMar w:top="1134" w:right="567" w:bottom="1134" w:left="1701" '
+        'w:header="708" w:footer="708" w:gutter="0"/>'
+    )
+
+    def rotate(sect_xml: str, orient: str, w: int, h: int) -> str:
+        sect_xml = re.sub(r"<w:pgSz[^/]*/>",
+                          f'<w:pgSz w:w="{w}" w:h="{h}" w:orient="{orient}"/>',
+                          sect_xml, count=1)
+        return sect_xml
+
+    def section_break(sect_xml: str) -> str:
+        # копия sectPr тела без своего колонтитула/нумерации: секция
+        # наследует колонтитулы предыдущей и не сбивает счёт страниц
+        sect_xml = re.sub(r"<w:titlePg[^/]*/>", "", sect_xml)
+        sect_xml = re.sub(r"<w:pgNumType[^/]*/>", "", sect_xml)
+        sect_xml = re.sub(r"<w:(?:header|footer)Reference[^/]*/>", "", sect_xml)
+        return f"<w:p><w:pPr><w:sectPr>{sect_xml}</w:sectPr></w:pPr></w:p>"
+
+    out, pos = [], 0
+    for m in re.finditer(r"<w:tbl>.*?</w:tbl>", document_xml, re.DOTALL):
+        tbl = m.group(0)
+        grid, dims = analyze(tbl)
+        need = sum(dims[1]) if dims else 0
+        if grid is None or need <= AVAIL:
+            continue  # обычный случай — вообще не трогаем текст вокруг
+
+        # альбомная секция: подпись (абзац «Таблица …» перед таблицей) + таблица
+        avail = AVAIL_LANDSCAPE
+        widths = distribute((*dims, avail))
+        tbl = apply_widths(tbl, grid, widths)
+
+        caption_start = m.start()
+        prev_para = None
+        for pm in _PARA_RE.finditer(document_xml, 0, m.start()):
+            prev_para = pm
+        if prev_para is not None:
+            ptxt = _para_text(prev_para.group(0)).strip()
+            if re.match(r"^таблица\s", ptxt, re.I):
+                caption_start = prev_para.start()
+
+        landscape_end = section_break(
+            rotate(sect_template, "landscape", 16838, 11906))
+        portrait_end = section_break(
+            rotate(sect_template, "portrait", 11906, 16838))
+
+        out.append(document_xml[pos:caption_start])
+        out.append(portrait_end)
+        out.append(document_xml[caption_start:m.start()])
+        out.append(tbl)
+        out.append(landscape_end)
+        pos = m.end()
+    out.append(document_xml[pos:])
+    return "".join(out)
 
 
 def _center_row_paragraphs(row_xml: str) -> str:
@@ -1443,9 +1523,11 @@ def normalize_final_sections(output_path: Path, reference_doc: Path):
 
     def fix_sect(m: re.Match, is_last: bool) -> str:
         sect = m.group(0)
-        if ref_pgsz:
+        # альбомные секции (широкие таблицы) своей геометрии не отдают
+        is_landscape = 'w:orient="landscape"' in sect
+        if ref_pgsz and not is_landscape:
             sect = re.sub(r'<w:pgSz[^/]*/>', ref_pgsz.group(0), sect, count=1)
-        if ref_pgmar:
+        if ref_pgmar and not is_landscape:
             sect = re.sub(r'<w:pgMar[^/]*/>', ref_pgmar.group(0), sect, count=1)
 
         numbered_here = is_last  # only the body section is numbered
